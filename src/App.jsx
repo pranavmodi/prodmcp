@@ -6,7 +6,7 @@ import Crawler from './components/Crawler';
 import Navbar from './components/Navbar';
 
 function App() {
-  const [activeTab, setActiveTab] = useState('scrape');
+  const [activeTab, setActiveTab] = useState('crawl');
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -20,17 +20,15 @@ function App() {
       console.log('Setting active tab to crawl');
       setActiveTab('crawl');
     } else {
-      console.log('Setting active tab to scrape');
-      setActiveTab('scrape');
+      console.log('Setting active tab to crawl');
+      setActiveTab('crawl');
     }
   }, [location.pathname]);
 
   const handleTabChange = (tab) => {
     console.log('Tab changed to:', tab);
     setActiveTab(tab);
-    if (tab === 'scrape') {
-      navigate('/');
-    } else if (tab === 'crawl') {
+    if (tab === 'crawl') {
       navigate('/crawl');
     } else if (tab === 'ask') {
       navigate('/ask');
@@ -46,16 +44,7 @@ function App() {
         <div className="flex justify-center mb-8">
           <div className="bg-white rounded-lg shadow-md p-1">
             <div className="flex space-x-1">
-              <button
-                onClick={() => handleTabChange('scrape')}
-                className={`px-6 py-3 rounded-md font-medium transition-colors ${
-                  activeTab === 'scrape'
-                    ? 'bg-blue-600 text-white shadow-sm'
-                    : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100'
-                }`}
-              >
-                📄 Single Page Scraper
-              </button>
+              {/* Single Page Scraper tab removed */}
               <button
                 onClick={() => handleTabChange('crawl')}
                 className={`px-6 py-3 rounded-md font-medium transition-colors ${
@@ -82,19 +71,7 @@ function App() {
 
         {/* Main Content Area with Routes */}
         <Routes>
-          <Route path="/" element={
-            <div>
-              <div className="text-center mb-6">
-                <h1 className="text-4xl font-bold text-gray-800 mb-4">
-                  📄 Single Page Scraper
-                </h1>
-                <p className="text-xl text-gray-600">
-                  Scrape individual web pages and save their content
-                </p>
-              </div>
-              <Home />
-            </div>
-          } />
+          <Route path="/" element={<Crawler />} />
           
           <Route path="/crawl" element={
             <div>

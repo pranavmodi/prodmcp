@@ -1,13 +1,20 @@
 import React, { useState } from 'react';
 import axios from 'axios';
+import api, { apiService } from '../services/api';
 
 const Crawler = () => {
   const [url, setUrl] = useState('');
-  const [maxPages, setMaxPages] = useState(50);
-  const [delayRange, setDelayRange] = useState([3, 7]);
   const [isLoading, setIsLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
+  const [progress, setProgress] = useState({ status: 'idle', crawl: { percent: 0 }, scrape: { percent: 0 } });
+  const [pollId, setPollId] = useState(null);
+  const [exclusions, setExclusions] = useState('');
+  const [urls, setUrls] = useState({ accepted: [], rejected: [] });
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState(null);
+  const [uploadedFiles, setUploadedFiles] = useState([]);
+  const [uploadedFilesMeta, setUploadedFilesMeta] = useState([]);
 
   const handleCrawl = async (e) => {
     e.preventDefault();
@@ -23,23 +30,88 @@ const Crawler = () => {
     try {
       const response = await axios.post('http://localhost:8000/crawl', {
         url: url.trim(),
-        max_pages: parseInt(maxPages),
-        delay_range: delayRange
+        exclusions: exclusions
+          .split(/\n|,/)
+          .map(s => s.trim().replace(/^@+/, ''))
+          .filter(Boolean)
       });
 
       setResult(response.data);
+      // Start polling progress
+      if (pollId) {
+        clearInterval(pollId);
+      }
+      const id = setInterval(async () => {
+        try {
+          const { data } = await axios.get('http://localhost:8000/crawl/stats');
+          const job = data?.crawl_stats || {};
+          setProgress(job);
+          // also poll discovered urls
+          try {
+            const urlsRes = await axios.get('http://localhost:8000/crawl/urls');
+            const accepted = urlsRes?.data?.accepted_urls || [];
+            const rejected = urlsRes?.data?.rejected_urls || [];
+            setUrls({ accepted, rejected });
+          } catch (_) {}
+          if (job?.status === 'done' || job?.status === 'error') {
+            clearInterval(id);
+            setPollId(null);
+            setIsLoading(false);
+          }
+        } catch (e) {
+          clearInterval(id);
+          setPollId(null);
+        }
+      }, 1000);
+      setPollId(id);
     } catch (err) {
       setError(err.response?.data?.detail || err.message || 'Failed to crawl website');
     } finally {
-      setIsLoading(false);
+      // Keep loading until job finishes (poller will unset)
     }
   };
 
-  const handleDelayChange = (index, value) => {
-    const newDelayRange = [...delayRange];
-    newDelayRange[index] = parseInt(value);
-    setDelayRange(newDelayRange);
+  const handleDelayChange = () => {};
+
+  const handleUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    setUploadError(null);
+    try {
+      // use axios instance with baseURL for multipart since default apiService returns the instance too
+      const formData = new FormData();
+      formData.append('file', file);
+      await api.post('/upload', formData, { headers: { 'Content-Type': 'multipart/form-data' }});
+      // refresh lists
+      try {
+        const urlsRes = await axios.get('http://localhost:8000/crawl/urls');
+        const accepted = urlsRes?.data?.accepted_urls || [];
+        const rejected = urlsRes?.data?.rejected_urls || [];
+        setUrls({ accepted, rejected });
+        // refresh uploaded list
+        const files = await apiService.listFiles();
+        setUploadedFiles(files?.uploaded_files || []);
+        setUploadedFilesMeta(files?.uploaded_files_meta || []);
+      } catch (_) {}
+    } catch (err) {
+      setUploadError(err.response?.data?.detail || err.message || 'Upload failed');
+    } finally {
+      setUploading(false);
+      e.target.value = '';
+    }
   };
+
+  // Load uploaded files on mount
+  React.useEffect(() => {
+    (async () => {
+      try {
+        const files = await apiService.listFiles();
+        setUploadedFiles(files?.uploaded_files || []);
+        setUploadedFilesMeta(files?.uploaded_files_meta || []);
+      } catch (e) {}
+    })();
+  }, []);
 
   return (
     <div className="max-w-4xl mx-auto p-6">
@@ -72,64 +144,7 @@ const Crawler = () => {
             </p>
           </div>
 
-          {/* Max Pages */}
-          <div>
-            <label htmlFor="maxPages" className="block text-sm font-medium text-gray-700 mb-2">
-              Maximum Pages to Crawl
-            </label>
-            <input
-              type="number"
-              id="maxPages"
-              value={maxPages}
-              onChange={(e) => setMaxPages(e.target.value)}
-              min="1"
-              max="1000"
-              className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-            />
-            <p className="text-sm text-gray-500 mt-1">
-              Limit the total number of pages to crawl (1-1000)
-            </p>
-          </div>
-
-          {/* Delay Range */}
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">
-              Delay Between Requests (seconds)
-            </label>
-            <div className="flex space-x-4">
-              <div className="flex-1">
-                <label htmlFor="minDelay" className="block text-xs text-gray-500 mb-1">
-                  Minimum Delay
-                </label>
-                <input
-                  type="number"
-                  id="minDelay"
-                  value={delayRange[0]}
-                  onChange={(e) => handleDelayChange(0, e.target.value)}
-                  min="1"
-                  max="30"
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                />
-              </div>
-              <div className="flex-1">
-                <label htmlFor="maxDelay" className="block text-xs text-gray-500 mb-1">
-                  Maximum Delay
-                </label>
-                <input
-                  type="number"
-                  id="maxDelay"
-                  value={delayRange[1]}
-                  onChange={(e) => handleDelayChange(1, e.target.value)}
-                  min="1"
-                  max="30"
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                />
-              </div>
-            </div>
-            <p className="text-sm text-gray-500 mt-1">
-              Random delay between requests to be respectful to servers
-            </p>
-          </div>
+          {/* Max Pages and Delay controls removed per requirements */}
 
           {/* Submit Button */}
           <button
@@ -154,6 +169,100 @@ const Crawler = () => {
             )}
           </button>
         </form>
+
+        {/* Progress Bars */}
+        <div className="mt-6 space-y-4">
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-sm font-medium text-gray-700">Crawling Progress</span>
+              <span className="text-sm text-gray-600">{progress?.crawl?.percent ?? 0}%</span>
+            </div>
+            <div className="w-full bg-gray-200 rounded-full h-3">
+              <div className="bg-blue-600 h-3 rounded-full" style={{ width: `${progress?.crawl?.percent ?? 0}%` }}></div>
+            </div>
+          </div>
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-sm font-medium text-gray-700">Scraping Progress</span>
+              <span className="text-sm text-gray-600">{progress?.scrape?.percent ?? 0}%</span>
+            </div>
+            <div className="w-full bg-gray-200 rounded-full h-3">
+              <div className="bg-green-600 h-3 rounded-full" style={{ width: `${progress?.scrape?.percent ?? 0}%` }}></div>
+            </div>
+            <p className="text-xs text-gray-500 mt-1">
+              {progress?.scrape?.completed || 0} / {progress?.scrape?.total || 0} pages scraped
+            </p>
+          </div>
+        </div>
+
+        {/* Scraped URLs (Accepted/Rejected) - directly below exclusions */}
+        <div className="mt-6 p-4 bg-white border border-gray-200 rounded-lg">
+          <h3 className="text-lg font-medium text-gray-800 mb-2">Scraped URLs</h3>
+          <div className="space-y-6">
+            <div>
+              <h4 className="text-sm font-semibold text-green-700 mb-2">Accepted ({urls.accepted.length})</h4>
+              <div className="max-h-64 overflow-auto border rounded">
+                <ul className="text-xs divide-y">
+                  {urls.accepted.map((u, idx) => (
+                    <li key={`a-${idx}`} className="p-2 break-all">{u}</li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+            <div>
+              <h4 className="text-sm font-semibold text-red-700 mb-2">Rejected ({urls.rejected.length})</h4>
+              <div className="max-h-64 overflow-auto border rounded">
+                <ul className="text-xs divide-y">
+                  {urls.rejected.map((u, idx) => (
+                    <li key={`r-${idx}`} className="p-2 break-all">{u}</li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Uploaded Documents */}
+        <div className="mt-6 p-4 bg-white border border-gray-200 rounded-lg">
+          <h3 className="text-lg font-medium text-gray-800 mb-2">Uploaded Documents</h3>
+          {uploadedFilesMeta && uploadedFilesMeta.length > 0 ? (
+            <div className="max-h-48 overflow-auto border rounded">
+              <ul className="text-xs divide-y">
+                {uploadedFilesMeta.map((f, idx) => (
+                  <li key={`up-${idx}`} className="p-2 break-all">
+                    {f.source_file} <span className="text-gray-500">({f.type})</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : (
+            <p className="text-sm text-gray-500">No documents uploaded yet.</p>
+          )}
+        </div>
+
+        {/* Exclude URLs */}
+        <div className="mt-6">
+          <label htmlFor="exclusions" className="block text-sm font-medium text-gray-700 mb-2">
+            Exclude URLs (one per line or comma-separated)
+          </label>
+          <textarea
+            id="exclusions"
+            value={exclusions}
+            onChange={(e) => setExclusions(e.target.value)}
+            rows={3}
+            placeholder={"/blog\n?utm_\n#section"}
+            className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+          />
+          <p className="text-xs text-gray-500 mt-1">Path-prefix match. Example: enter "/reports" to skip all URLs under /reports.</p>
+          <div className="mt-3 flex items-center space-x-3">
+            <label className="inline-flex items-center px-3 py-2 bg-green-600 text-white text-sm font-medium rounded-lg cursor-pointer hover:bg-green-700">
+              <input type="file" accept=".txt,.docx,.pdf" className="hidden" onChange={handleUpload} disabled={uploading} />
+              Upload document (.txt, .docx, .pdf)
+            </label>
+            {uploading && <span className="text-sm text-green-700">Uploading...</span>}
+            {uploadError && <span className="text-sm text-red-600">{uploadError}</span>}
+          </div>
+        </div>
 
         {/* Error Display */}
         {error && (
@@ -204,6 +313,8 @@ const Crawler = () => {
             </div>
           </div>
         )}
+
+        
 
         {/* Info Box */}
         <div className="mt-6 p-4 bg-blue-50 border border-blue-200 rounded-lg">

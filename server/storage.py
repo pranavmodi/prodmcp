@@ -32,29 +32,30 @@ class HTMLStorage:
             raise
     
     def get_all_html_files(self) -> List[Path]:
-        """Get all HTML files in the storage directory and subdirectories."""
-        html_files = []
-        
-        # Look for HTML files in the main directory
-        main_pattern = self.data_dir / "*.html"
-        main_files = list(Path(main_pattern).parent.glob("*.html"))
-        html_files.extend(main_files)
-        
-        # Look for HTML files in subdirectories (domain directories)
-        for subdir in self.data_dir.iterdir():
-            if subdir.is_dir():
-                subdir_html_files = list(subdir.glob("*.html"))
-                html_files.extend(subdir_html_files)
-        
+        """Get all HTML/JSON files in the storage directory and subdirectories."""
+        files: List[Path] = []
+
+        # Look for HTML and JSON files in the main directory
+        main_dir = self.data_dir
+        if main_dir.exists():
+            files.extend(list(main_dir.glob("*.html")))
+            files.extend(list(main_dir.glob("*.json")))
+
+        # Look for files in subdirectories (domain directories)
+        if main_dir.exists():
+            for subdir in main_dir.iterdir():
+                if subdir.is_dir():
+                    files.extend(list(subdir.glob("*.html")))
+                    files.extend(list(subdir.glob("*.json")))
+
         # Remove duplicates and sort
-        html_files = list(set(html_files))
-        html_files.sort()
-        
-        logging.info(f"Found {len(html_files)} HTML files in {self.data_dir}")
-        for file in html_files:
+        files = sorted(set(files))
+
+        logging.info(f"Found {len(files)} data files in {self.data_dir}")
+        for file in files:
             logging.debug(f"  - {file}")
-        
-        return html_files
+
+        return files
     
     def read_html_file(self, filepath: Path) -> str:
         """Read HTML content from a file."""

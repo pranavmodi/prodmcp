@@ -25,6 +25,8 @@ const Ask = () => {
     }
   }
 
+  
+
   const handleSubmit = async (e) => {
     e.preventDefault()
     
@@ -150,6 +152,7 @@ const Ask = () => {
               <p className="text-sm text-blue-700 mb-2">
                 You have {availableFiles.total_files} scraped website{availableFiles.total_files !== 1 ? 's' : ''} available for analysis.
               </p>
+              
               {availableFiles.files && availableFiles.files.length > 0 && (
                 <div className="text-xs text-blue-600 space-y-1">
                   {availableFiles.files.slice(0, 3).map((file, index) => (

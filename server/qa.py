@@ -78,13 +78,22 @@ class QASystem:
         
         for file_path in html_files:
             try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    html_content = f.read()
-                
-                extracted_text = self.extract_text_from_html(html_content)
-                if extracted_text:
-                    filename = os.path.basename(file_path)
-                    contexts.append(f"--- File: {filename} ---\n{extracted_text}")
+                filename = os.path.basename(file_path)
+                if filename.endswith('.json'):
+                    import json
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    content = data.get('content', '')
+                    title = data.get('title', '')
+                    if content:
+                        header = f"Title: {title}\n" if title else ""
+                        contexts.append(f"--- File: {filename} ---\n{header}{content}")
+                else:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        html_content = f.read()
+                    extracted_text = self.extract_text_from_html(html_content)
+                    if extracted_text:
+                        contexts.append(f"--- File: {filename} ---\n{extracted_text}")
                     
             except Exception as e:
                 logging.error(f"Error reading file {file_path}: {e}")

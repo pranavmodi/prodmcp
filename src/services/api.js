@@ -71,7 +71,13 @@ export const apiService = {
   async askQuestion(question) {
     try {
       const response = await api.post('/ask', { question })
-      return response.data
+      const data = response.data
+      if (data?.mcp_debug) {
+        console.log('[MCP DEBUG] client', data.mcp_debug.client)
+        console.log('[MCP DEBUG] server', data.mcp_debug.server)
+        console.log('[MCP DEBUG] tool', data.mcp_debug.tool)
+      }
+      return data
     } catch (error) {
       throw error
     }
@@ -91,6 +97,20 @@ export const apiService = {
   async listFiles() {
     try {
       const response = await api.get('/files')
+      return response.data
+    } catch (error) {
+      throw error
+    }
+  },
+
+  // Upload a document (txt, docx, pdf)
+  async uploadDocument(file) {
+    try {
+      const formData = new FormData()
+      formData.append('file', file)
+      const response = await api.post('/upload', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' }
+      })
       return response.data
     } catch (error) {
       throw error

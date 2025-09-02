@@ -13,17 +13,21 @@ import sys
 
 # Import our existing functionality
 from storage import HTMLStorage
-from scraper import WebScraper
+from scraper import ModernScraper
 from qa import QASystem
 import os
 from dotenv import load_dotenv
 
 # Import FastAPI for HTTP endpoints
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
+from mcp_client import MCPStdIoClient, spawn_mcp_server
+import mimetypes
+import shutil
+from datetime import datetime
 
 # Load environment variables
 load_dotenv()
@@ -32,20 +36,22 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Global crawl job state
+_crawl_job = {
+    "status": "idle",  # idle | crawl | scrape | done | error
+    "message": None,
+    "crawl": {"accepted": 0, "rejected": 0, "discovered": 0, "percent": None},
+    "scrape": {"total": 0, "completed": 0, "percent": 0},
+    "started_at": None,
+    "updated_at": None,
+}
+_crawl_task: Optional[asyncio.Task] = None
+
 # Pydantic models for HTTP API
-class ScrapeRequest(BaseModel):
-    url: str
-
-class ScrapeResponse(BaseModel):
-    status: str
-    file: str
-    message: str
-    page_info: dict = None
-
 class CrawlRequest(BaseModel):
     url: str
-    max_pages: int = 50
-    delay_range: tuple = (3, 7)
+    # Optional list of URL substrings or full URLs to exclude from crawling/scraping
+    exclusions: Optional[List[str]] = None
 
 class CrawlResponse(BaseModel):
     status: str
@@ -60,6 +66,7 @@ class QuestionRequest(BaseModel):
 class QuestionResponse(BaseModel):
     answer: str
     context_info: dict = None
+    mcp_debug: dict = None
 
 class ErrorResponse(BaseModel):
     error: str
@@ -87,7 +94,7 @@ class MCPServer:
     def __init__(self):
         # Initialize our existing components
         self.storage = HTMLStorage(os.getenv("DATA_DIR", "./scraped_pages"))
-        self.scraper = WebScraper()  # This now includes the crawler!
+        self.scraper = ModernScraper(os.getenv("DATA_DIR", "./scraped_pages"))
         
         # Initialize OpenAI QA system
         openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -97,99 +104,25 @@ class MCPServer:
         else:
             self.qa_system = QASystem(openai_api_key)
         
-        # MCP tool definitions - Updated with new crawling tools
+        # MCP tool definitions - expose only lookup_kb as an MCP tool
         self.tools = [
             {
-                "name": "scrape_website",
-                "description": "Scrape a single website page and save the HTML content for later analysis",
+                "name": "lookup_kb",
+                "description": "Answer a question using the knowledge base built from scraped JSON (RAG-like)",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "url": {
+                        "query": {
                             "type": "string",
-                            "description": "The URL of the website page to scrape"
-                        }
-                    },
-                    "required": ["url"]
-                }
-            },
-            {
-                "name": "crawl_website",
-                "description": "Crawl an entire website to discover and scrape ALL pages automatically",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "The starting URL of the website to crawl"
+                            "description": "The user's question"
                         },
-                        "max_pages": {
+                        "k": {
                             "type": "integer",
-                            "description": "Maximum number of pages to crawl (default: 50, max: 1000)",
-                            "default": 50
-                        },
-                        "delay_range": {
-                            "type": "array",
-                            "description": "Delay range in seconds between scrapes [min, max] (default: [3, 7])",
-                            "items": {"type": "number"},
-                            "default": [3, 7]
+                            "description": "Top documents to retrieve",
+                            "default": 5
                         }
                     },
-                    "required": ["url"]
-                }
-            },
-            {
-                "name": "get_crawl_stats",
-                "description": "Get statistics about the website crawling operation",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
-            },
-            {
-                "name": "get_discovered_urls",
-                "description": "Get all discovered URLs from crawling operations",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
-            },
-            {
-                "name": "clear_crawl_data",
-                "description": "Clear all crawl data and start fresh",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
-            },
-            {
-                "name": "ask_question",
-                "description": "Ask a question about the scraped website content using AI",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "question": {
-                            "type": "string",
-                            "description": "The question to ask about the scraped content"
-                        }
-                    },
-                    "required": ["question"]
-                }
-            },
-            {
-                "name": "list_scraped_files",
-                "description": "List all currently scraped website files",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
-            },
-            {
-                "name": "get_server_status",
-                "description": "Get the current status of the MCP server and storage",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
+                    "required": ["query"]
                 }
             }
         ]
@@ -216,22 +149,8 @@ class MCPServer:
     async def handle_tools_call(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Handle tools/call request"""
         try:
-            if name == "scrape_website":
-                return await self._scrape_website(arguments)
-            elif name == "crawl_website":
-                return await self._crawl_website(arguments)
-            elif name == "get_crawl_stats":
-                return await self._get_crawl_stats()
-            elif name == "get_discovered_urls":
-                return await self._get_discovered_urls()
-            elif name == "clear_crawl_data":
-                return await self._clear_crawl_data()
-            elif name == "ask_question":
-                return await self._ask_question(arguments)
-            elif name == "list_scraped_files":
-                return await self._list_scraped_files()
-            elif name == "get_server_status":
-                return await self._get_server_status()
+            if name == "lookup_kb":
+                return await self._lookup_kb(arguments)
             else:
                 raise ValueError(f"Unknown tool: {name}")
         except Exception as e:
@@ -250,25 +169,21 @@ class MCPServer:
         if not url:
             raise ValueError("URL is required")
         
-        # Use our existing scraper
-        html_content, domain = self.scraper.scrape_url(url)
-        filename = self.storage.save_html(domain, html_content)
-        page_info = self.scraper.get_page_info(html_content)
+        # Use async modern scraper
+        result = await self.scraper.scrape_url(url)
+        if not result:
+            raise ValueError("Failed to scrape content")
+        await self.scraper.save_content(result, url)
         
         return {
             "content": [
-                {
-                    "type": "text",
-                    "text": f"Successfully scraped single page {url} and saved as {filename}"
-                }
+                {"type": "text", "text": f"Successfully scraped single page {url}"}
             ],
             "isError": False,
             "toolCallId": "scrape_result",
             "metadata": {
-                "filename": filename,
-                "domain": domain,
-                "page_info": page_info,
-                "type": "single_page"
+                "result": result,
+                "type": "single_page_json"
             }
         }
     
@@ -288,23 +203,53 @@ class MCPServer:
         if len(delay_range) != 2 or delay_range[0] < 0 or delay_range[1] < delay_range[0]:
             raise ValueError("delay_range must be [min_delay, max_delay] with min_delay <= max_delay")
         
-        # Use the new integrated crawling and scraping functionality
-        result = self.scraper.crawl_and_scrape_website(
-            base_url=url,
-            max_pages=max_pages,
-            delay_range=tuple(delay_range)
+        # Use file-based crawler and then batch scrape discovered URLs
+        from crawler import crawl_website, load_existing_urls
+
+        data_dir = os.getenv("DATA_DIR", "./scraped_pages")
+        accepted_file = os.path.join(data_dir, "accepted_urls.txt")
+        rejected_file = os.path.join(data_dir, "rejected_urls.txt")
+
+        existing_accepted = load_existing_urls(accepted_file)
+        existing_rejected = load_existing_urls(rejected_file)
+
+        crawl_website(
+            base_url=url.strip(),
+            accepted_file=accepted_file,
+            rejected_file=rejected_file,
+            existing_accepted=existing_accepted,
+            existing_rejected=existing_rejected
         )
-        
-        # Get crawl statistics
-        crawl_stats = self.scraper.get_crawl_stats()
+
+        all_accepted = load_existing_urls(accepted_file)
+        scraped_files = []
+        failed_urls = []
+        if all_accepted:
+            try:
+                # Prioritize root/base URL first for better seeding
+                sorted_urls = sorted(all_accepted, key=lambda u: len(u))
+                results = await self.scraper.scrape_urls_batch(sorted_urls)
+                scraped_files = [r.get("url") for r in results if r]
+                failed_urls = [u for u in sorted_urls if u not in scraped_files]
+            except Exception as e:
+                logger.error(f"Batch scrape error: {e}")
+                failed_urls = list(all_accepted)
+
+        crawl_stats = {
+            "total_accepted": len(load_existing_urls(accepted_file)),
+            "total_rejected": len(load_existing_urls(rejected_file)),
+            "total_urls": len(load_existing_urls(accepted_file)) + len(load_existing_urls(rejected_file)),
+            "accepted_file": accepted_file,
+            "rejected_file": rejected_file
+        }
         
         return {
             "content": [
                 {
                     "type": "text",
                     "text": f"Successfully crawled and scraped entire website {url}\n" +
-                           f"📁 Scraped files: {len(result['scraped_files'])}\n" +
-                           f"❌ Failed URLs: {len(result['failed_urls'])}\n" +
+                           f"📁 Scraped files: {len(scraped_files)}\n" +
+                           f"❌ Failed URLs: {len(failed_urls)}\n" +
                            f"📊 Total discovered URLs: {crawl_stats['total_urls']}"
                 }
             ],
@@ -312,8 +257,8 @@ class MCPServer:
             "toolCallId": "crawl_result",
             "metadata": {
                 "base_url": url,
-                "scraped_files": result["scraped_files"],
-                "failed_urls": result["failed_urls"],
+                "scraped_files": scraped_files,
+                "failed_urls": failed_urls,
                 "crawl_stats": crawl_stats,
                 "type": "full_website_crawl"
             }
@@ -322,7 +267,17 @@ class MCPServer:
     async def _get_crawl_stats(self) -> Dict[str, Any]:
         """Get crawling statistics"""
         try:
-            stats = self.scraper.get_crawl_stats()
+            data_dir = os.getenv("DATA_DIR", "./scraped_pages")
+            accepted_file = os.path.join(data_dir, "accepted_urls.txt")
+            rejected_file = os.path.join(data_dir, "rejected_urls.txt")
+            from crawler import load_existing_urls
+            stats = {
+                "total_accepted": len(load_existing_urls(accepted_file)),
+                "total_rejected": len(load_existing_urls(rejected_file)),
+                "total_urls": len(load_existing_urls(accepted_file)) + len(load_existing_urls(rejected_file)),
+                "accepted_file": accepted_file,
+                "rejected_file": rejected_file
+            }
             
             return {
                 "content": [
@@ -345,7 +300,12 @@ class MCPServer:
     async def _get_discovered_urls(self) -> Dict[str, Any]:
         """Get all discovered URLs"""
         try:
-            accepted_urls, rejected_urls = self.scraper.get_discovered_urls()
+            data_dir = os.getenv("DATA_DIR", "./scraped_pages")
+            accepted_file = os.path.join(data_dir, "accepted_urls.txt")
+            rejected_file = os.path.join(data_dir, "rejected_urls.txt")
+            from crawler import load_existing_urls
+            accepted_urls = load_existing_urls(accepted_file)
+            rejected_urls = load_existing_urls(rejected_file)
             
             return {
                 "content": [
@@ -375,7 +335,14 @@ class MCPServer:
     async def _clear_crawl_data(self) -> Dict[str, Any]:
         """Clear all crawl data"""
         try:
-            self.scraper.clear_crawl_data()
+            data_dir = os.getenv("DATA_DIR", "./scraped_pages")
+            for name in ["accepted_urls.txt", "rejected_urls.txt", "crawler_cookies.txt"]:
+                path = os.path.join(data_dir, name)
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except Exception:
+                    pass
             
             return {
                 "content": [
@@ -476,6 +443,24 @@ class MCPServer:
             }
         }
 
+    async def _lookup_kb(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Lookup knowledge base from local scraped JSON using a minimal RAG approach."""
+        query = arguments.get("query")
+        if not query:
+            raise ValueError("query is required")
+        k = int(arguments.get("k", 5))
+        from kb import lookup_kb_minimal
+        result = lookup_kb_minimal(query, k=k)
+        text = result.get("answer", "")
+        return {
+            "content": [
+                {"type": "text", "text": text[:4000]}
+            ],
+            "isError": False,
+            "toolCallId": "lookup_kb_result",
+            "metadata": result
+        }
+
 # Global exception handler for HTTP API
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -492,7 +477,7 @@ async def root():
     return {
         "message": "MCP Web Scraper & QA Server (Hybrid MCP + HTTP)",
         "version": "1.0.0",
-        "endpoints": ["/scrape", "/crawl", "/ask", "/status", "/files"],
+        "endpoints": ["/crawl", "/ask", "/status", "/files", "/upload"],
         "mcp_enabled": True,
         "status": "running"
     }
@@ -517,147 +502,183 @@ async def get_status():
         logger.error(f"Error getting status: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/scrape", response_model=ScrapeResponse)
-async def scrape_website(request: ScrapeRequest):
-    """Scrape a website and save the HTML content."""
-    try:
-        logger.info(f"Scraping request received for URL: {request.url}")
-        
-        # Validate URL
-        if not request.url or not request.url.strip():
-            raise HTTPException(status_code=400, detail="URL is required")
-        
-        # Create a temporary server instance
-        temp_server = MCPServer()
-        
-        # Scrape the website
-        html_content, domain = temp_server.scraper.scrape_url(request.url.strip())
-        
-        # Save the HTML content
-        filename = temp_server.storage.save_html(domain, html_content)
-        
-        # Get page information
-        page_info = temp_server.scraper.get_page_info(html_content)
-        
-        logger.info(f"Successfully scraped and saved: {filename}")
-        
-        return ScrapeResponse(
-            status="success",
-            file=filename,
-            message=f"Successfully scraped {request.url}",
-            page_info=page_info
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error scraping {request.url}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to scrape website: {str(e)}")
+# Removed single-page /scrape endpoint per new requirements
 
 @app.post("/crawl", response_model=CrawlResponse)
 async def crawl_website(request: CrawlRequest):
-    """Crawl a website to discover URLs and then scrape all discovered pages."""
+    """Start a crawl job and return immediately; progress can be polled via /crawl/progress."""
     try:
         logger.info(f"Crawl request received for URL: {request.url}")
-        
-        # Validate URL
+
         if not request.url or not request.url.strip():
             raise HTTPException(status_code=400, detail="URL is required")
-        
-        # Validate parameters
-        if request.max_pages < 1 or request.max_pages > 1000:
-            raise HTTPException(status_code=400, detail="max_pages must be between 1 and 1000")
-        
-        if len(request.delay_range) != 2 or request.delay_range[0] < 0 or request.delay_range[1] < request.delay_range[0]:
-            raise HTTPException(status_code=400, detail="delay_range must be a tuple of (min_delay, max_delay) with min_delay <= max_delay")
-        
-        logger.info(f"Starting crawl with max_pages={request.max_pages}, delay_range={request.delay_range}")
-        
-        # Create a temporary server instance
-        temp_server = MCPServer()
-        
-        # Perform crawl and scrape operation
-        result = temp_server.scraper.crawl_and_scrape_website(
-            base_url=request.url.strip(),
-            max_pages=request.max_pages,
-            delay_range=request.delay_range
-        )
-        
-        # Get crawl statistics
-        crawl_stats = temp_server.scraper.get_crawl_stats()
-        
-        # Get discovered URLs for debugging
-        accepted_urls, rejected_urls = temp_server.scraper.get_discovered_urls()
-        
-        logger.info(f"Crawl completed. Result: {result}")
-        logger.info(f"Accepted URLs: {len(accepted_urls)}")
-        logger.info(f"Rejected URLs: {len(rejected_urls)}")
-        logger.info(f"Scraped files: {len(result['scraped_files'])}")
-        logger.info(f"Failed URLs: {len(result['failed_urls'])}")
-        
+
+        global _crawl_task, _crawl_job
+        if _crawl_task and not _crawl_task.done():
+            raise HTTPException(status_code=409, detail="A crawl is already in progress")
+
+        # Reset job state
+        _crawl_job.update({
+            "status": "crawl",
+            "message": None,
+            "crawl": {"accepted": 0, "rejected": 0, "discovered": 0, "percent": 0},
+            "scrape": {"total": 0, "completed": 0, "percent": 0},
+            "started_at": asyncio.get_event_loop().time(),
+            "updated_at": asyncio.get_event_loop().time(),
+        })
+
+        async def _run_job(base_url: str, exclusions: Optional[List[str]]):
+            try:
+                server = MCPServer()
+                from crawler import crawl_website as crawl_urls, load_existing_urls
+                data_dir = os.getenv("DATA_DIR", "./scraped_pages")
+                accepted_file = os.path.join(data_dir, "accepted_urls.txt")
+                rejected_file = os.path.join(data_dir, "rejected_urls.txt")
+
+                existing_accepted = load_existing_urls(accepted_file)
+                existing_rejected = load_existing_urls(rejected_file)
+
+                # Crawl (blocking in this thread)
+                crawl_urls(
+                    base_url=base_url,
+                    accepted_file=accepted_file,
+                    rejected_file=rejected_file,
+                    existing_accepted=existing_accepted,
+                    existing_rejected=existing_rejected,
+                    exclusion_urls=(exclusions or [])
+                )
+
+                # Update crawl progress
+                all_accepted = load_existing_urls(accepted_file)
+                _crawl_job["crawl"]["accepted"] = len(all_accepted)
+                _crawl_job["crawl"]["rejected"] = len(load_existing_urls(rejected_file))
+                _crawl_job["crawl"]["discovered"] = _crawl_job["crawl"]["accepted"] + _crawl_job["crawl"]["rejected"]
+                _crawl_job["crawl"]["percent"] = 100
+                _crawl_job["status"] = "scrape"
+                _crawl_job["updated_at"] = asyncio.get_event_loop().time()
+
+                # Scrape with progress callback
+                sorted_urls = sorted(all_accepted)
+                total = len(sorted_urls)
+                _crawl_job["scrape"]["total"] = total
+                _crawl_job["scrape"]["completed"] = 0
+                _crawl_job["scrape"]["percent"] = 0 if total == 0 else 0
+
+                async def _progress_callback(done: int, total_cb: int):
+                    _crawl_job["scrape"]["completed"] = done
+                    _crawl_job["scrape"]["percent"] = int(done * 100 / max(total_cb, 1))
+                    _crawl_job["updated_at"] = asyncio.get_event_loop().time()
+
+                if total > 0:
+                    await server.scraper.scrape_urls_batch(sorted_urls, progress_callback=_progress_callback)
+
+                _crawl_job["status"] = "done"
+                _crawl_job["message"] = f"Crawled and scraped {base_url}"
+                _crawl_job["updated_at"] = asyncio.get_event_loop().time()
+            except Exception as e:
+                _crawl_job["status"] = "error"
+                _crawl_job["message"] = str(e)
+                _crawl_job["updated_at"] = asyncio.get_event_loop().time()
+
+        _crawl_task = asyncio.create_task(_run_job(request.url.strip(), (request.exclusions or [])))
+
         return CrawlResponse(
-            status="success",
-            message=f"Successfully crawled and scraped {request.url}",
-            scraped_files=result["scraped_files"],
-            failed_urls=result["failed_urls"],
-            crawl_stats=crawl_stats
+            status="started",
+            message="Crawl job started",
+            scraped_files=[],
+            failed_urls=[],
+            crawl_stats={}
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error crawling {request.url}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to crawl website: {str(e)}")
+        logger.error(f"Error starting crawl {request.url}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to start crawl: {str(e)}")
 
 @app.post("/ask", response_model=QuestionResponse)
 async def ask_question(request: QuestionRequest):
     """Ask a question about the scraped content using AI."""
     try:
-        # Create a temporary server instance
-        temp_server = MCPServer()
-        
-        if not temp_server.qa_system:
-            raise HTTPException(
-                status_code=500, 
-                detail="OpenAI API not configured. Please set OPENAI_API_KEY environment variable."
-            )
-        
         if not request.question or not request.question.strip():
             raise HTTPException(status_code=400, detail="Question is required")
-        
-        logger.info(f"Question received: {request.question[:50]}...")
-        
-        # Get all HTML files
-        html_files = temp_server.storage.get_all_html_files()
-        
-        if not html_files:
-            raise HTTPException(
-                status_code=400, 
-                detail="No scraped pages found. Please scrape some websites first."
+
+        logger.info(f"Question received (MCP): {request.question[:50]}...")
+
+        # Spawn MCP server (stdio-only) and call the lookup_kb tool via MCP client
+        proc = await spawn_mcp_server(project_root=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+        client = MCPStdIoClient(proc)
+
+        try:
+            # Prepare debug payload
+            mcp_debug = {
+                "client": {
+                    "spawned": True,
+                    "pid": proc.pid,
+                },
+                "server": {},
+                "tool": {
+                    "name": "lookup_kb",
+                    "args": {"k": 5, "queryLength": len(request.question.strip())}
+                }
+            }
+
+            init_result = await client.initialize()
+            mcp_debug["server"] = {
+                "protocolVersion": init_result.get("protocolVersion"),
+                "serverInfo": init_result.get("serverInfo"),
+                "capabilities": init_result.get("capabilities")
+            }
+
+            tool_args = {"query": request.question.strip(), "k": 10}
+            tool_result = await client.tools_call("lookup_kb", tool_args)
+
+            # Handle tool errors surfaced via result
+            if tool_result.get("isError"):
+                err = tool_result.get("error") or {}
+                message = err.get("message") or "Tool call failed"
+                raise HTTPException(status_code=500, detail=message)
+
+            # Extract answer and construct context_info compatible with the frontend
+            metadata = tool_result.get("metadata") or {}
+            answer = metadata.get("answer")
+
+            if not answer:
+                contents = tool_result.get("content") or []
+                texts = [c.get("text", "") for c in contents if isinstance(c, dict) and c.get("type") == "text"]
+                answer = "\n".join([t for t in texts if t]) or "No answer returned."
+
+            citations = metadata.get("citations") or []
+            context_info = {
+                "total_files": len(citations),
+                "files": [
+                    {
+                        "filename": (c.get("url") or c.get("title") or "unknown")
+                    }
+                    for c in citations if isinstance(c, dict)
+                ]
+            }
+
+            # Fill tool debug
+            mcp_debug["tool"].update({
+                "success": True,
+                "contentCount": len(tool_result.get("content") or []),
+                "metadataKeys": list((tool_result.get("metadata") or {}).keys()),
+            })
+
+            logger.info("Question answered successfully via MCP")
+
+            return QuestionResponse(
+                answer=answer,
+                context_info=context_info,
+                mcp_debug=mcp_debug
             )
-        
-        # Build context from HTML files
-        file_paths = [str(f) for f in html_files]
-        context = temp_server.qa_system.build_context_from_files(file_paths)
-        
-        if not context.strip():
-            raise HTTPException(
-                status_code=500, 
-                detail="Failed to extract meaningful content from scraped pages."
-            )
-        
-        # Ask the question
-        answer = temp_server.qa_system.ask_question(request.question.strip(), context)
-        
-        # Get context information
-        context_info = temp_server.qa_system.get_available_files_summary(file_paths)
-        
-        logger.info(f"Question answered successfully")
-        
-        return QuestionResponse(
-            answer=answer,
-            context_info=context_info
-        )
+        finally:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
         
     except HTTPException:
         raise
@@ -672,6 +693,37 @@ async def list_files():
         # Create a temporary server instance
         temp_server = MCPServer()
         storage_info = temp_server.storage.get_storage_info()
+
+        # Detect uploaded documents by reading json metadata/url
+        uploaded_files: list[str] = []
+        uploaded_files_meta: list[dict] = []
+        try:
+            base = storage_info.get("storage_path")
+            for name in storage_info.get("files", []):
+                if not name.endswith('.json'):
+                    continue
+                fpath = os.path.join(base, name)
+                try:
+                    with open(fpath, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    url = str(data.get('url', ''))
+                    meta = data.get('metadata', {}) or {}
+                    if url.startswith('uploaded://') or ('uploaded_at' in meta):
+                        uploaded_files.append(name)
+                        uploaded_files_meta.append({
+                            "filename": name,
+                            "source_file": meta.get('source_file') or data.get('title') or name,
+                            "url": url,
+                            "type": meta.get('type') or 'unknown'
+                        })
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        storage_info["uploaded_files"] = uploaded_files
+        storage_info["uploaded_count"] = len(uploaded_files)
+        storage_info["uploaded_files_meta"] = uploaded_files_meta
         return storage_info
     except Exception as e:
         logger.error(f"Error listing files: {e}")
@@ -681,11 +733,9 @@ async def list_files():
 async def get_crawl_stats():
     """Get statistics about the crawling operation."""
     try:
-        temp_server = MCPServer()
-        stats = temp_server.scraper.get_crawl_stats()
         return {
             "status": "success",
-            "crawl_stats": stats
+            "crawl_stats": _crawl_job
         }
     except Exception as e:
         logger.error(f"Error getting crawl stats: {e}")
@@ -695,8 +745,14 @@ async def get_crawl_stats():
 async def get_discovered_urls():
     """Get the currently discovered accepted and rejected URLs."""
     try:
-        temp_server = MCPServer()
-        accepted_urls, rejected_urls = temp_server.scraper.get_discovered_urls()
+        data_dir = os.getenv("DATA_DIR", "./scraped_pages")
+        accepted_file = os.path.join(data_dir, "accepted_urls.txt")
+        rejected_file = os.path.join(data_dir, "rejected_urls.txt")
+        from crawler import load_existing_urls
+        accepted_urls = load_existing_urls(accepted_file)
+        rejected_urls = load_existing_urls(rejected_file)
+        # Prefer rejected: don't show items in both; subtract from accepted for UI consistency
+        accepted_urls = accepted_urls.difference(rejected_urls)
         return {
             "status": "success",
             "accepted_urls": list(accepted_urls),
@@ -712,14 +768,109 @@ async def get_discovered_urls():
 async def clear_crawl_data():
     """Clear all crawl data and start fresh."""
     try:
-        temp_server = MCPServer()
-        temp_server.scraper.clear_crawl_data()
+        data_dir = os.getenv("DATA_DIR", "./scraped_pages")
+        for name in ["accepted_urls.txt", "rejected_urls.txt", "crawler_cookies.txt"]:
+            path = os.path.join(data_dir, name)
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
         return {
             "status": "success",
             "message": "All crawl data cleared successfully"
         }
     except Exception as e:
         logger.error(f"Error clearing crawl data: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """Upload a .txt, .docx, or .pdf file and store as JSON in DATA_DIR so KB can use it."""
+    try:
+        if not file:
+            raise HTTPException(status_code=400, detail="File is required")
+
+        filename = file.filename or "uploaded"
+        ext = (filename.split('.')[-1] or '').lower()
+        allowed = {"txt", "docx", "pdf"}
+        if ext not in allowed:
+            raise HTTPException(status_code=400, detail="Only .txt, .docx, .pdf are allowed")
+
+        # Save to temp
+        data_dir = os.getenv("DATA_DIR", "./scraped_pages")
+        Path(data_dir).mkdir(parents=True, exist_ok=True)
+        tmp_path = Path(data_dir) / f"_upload_tmp_{datetime.utcnow().timestamp()}_{filename}"
+        with open(tmp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # Extract text
+        text_content = ""
+        title = filename
+        if ext == "txt":
+            with open(tmp_path, "r", encoding="utf-8", errors="ignore") as f:
+                text_content = f.read()
+        elif ext == "docx":
+            try:
+                import docx
+            except Exception:
+                raise HTTPException(status_code=500, detail="python-docx is not installed on server")
+            doc = docx.Document(str(tmp_path))
+            text_content = "\n".join([p.text for p in doc.paragraphs])
+        elif ext == "pdf":
+            try:
+                import PyPDF2
+            except Exception:
+                raise HTTPException(status_code=500, detail="PyPDF2 is not installed on server")
+            reader = PyPDF2.PdfReader(str(tmp_path))
+            parts = []
+            for page in reader.pages:
+                try:
+                    parts.append(page.extract_text() or "")
+                except Exception:
+                    continue
+            text_content = "\n".join(parts)
+
+        # Remove temp
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+        if not text_content.strip():
+            raise HTTPException(status_code=400, detail="No extractable text from file")
+
+        # Save as a JSON doc in DATA_DIR, compatible with KB lookup
+        # Use pseudo-url schema to keep format uniform
+        pseudo_url = f"uploaded://{filename}"
+        content = {
+            "url": pseudo_url,
+            "title": title,
+            "content": text_content,
+            "markdown": text_content,
+            "links": [],
+            "metadata": {
+                "uploaded_at": datetime.utcnow().isoformat(),
+                "source_file": filename,
+                "type": ext,
+            },
+        }
+
+        # Reuse scraper save path convention
+        from scrapers.enhanced_scraper import SimpleHTTPScraper
+        saver = SimpleHTTPScraper()
+        saved_path = await saver.save_content(content, pseudo_url)
+
+        return {
+            "status": "success",
+            "message": "File uploaded and indexed",
+            "file": filename,
+            "stored": saved_path,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading file: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 class MCPTransport:
