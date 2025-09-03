@@ -16,6 +16,18 @@ def _tokenize(text: str) -> List[str]:
     return _WORD_RE.findall(text.lower()) if text else []
 
 
+def _preprocess_for_tokens(text: str) -> str:
+    """Preprocess text (esp. filenames/URLs) to improve tokenization: split underscores, dashes, and camel case."""
+    if not text:
+        return ""
+    t = text
+    # Replace underscores/dashes with spaces
+    t = re.sub(r"[_\-]+", " ", t)
+    # Insert space before camel-case boundaries (e.g., NehaPipada -> Neha Pipada)
+    t = re.sub(r"(?<=[A-Za-z])(?=[A-Z][a-z])", " ", t)
+    return t
+
+
 def _score(query_tokens: List[str], doc_tokens: List[str]) -> float:
     if not query_tokens or not doc_tokens:
         return 0.0
@@ -163,6 +175,10 @@ def _iter_scraped_json_files(data_dir: str) -> List[Path]:
 def search_data_dir(query: str, k: int = 5) -> List[Dict[str, Any]]:
     data_dir = os.getenv("DATA_DIR", "./scraped_pages")
     query_tokens = _tokenize(query)
+    # Use content-bearing tokens for scoring
+    query_tokens_scored = [t for t in query_tokens if t not in _STOPWORDS and len(t) > 2]
+    if not query_tokens_scored:
+        query_tokens_scored = query_tokens
     query_token_set = set(query_tokens)
     candidates: List[Dict[str, Any]] = []
     for fp in _iter_scraped_json_files(data_dir):
@@ -176,12 +192,12 @@ def search_data_dir(query: str, k: int = 5) -> List[Dict[str, Any]]:
             chunks = _split_into_chunks(content, max_chars=1200, overlap=150)
             if not chunks:
                 chunks = [content]
-            title_url_tokens = _tokenize(title) + _tokenize(url)
+            title_url_tokens = _tokenize(_preprocess_for_tokens(title)) + _tokenize(_preprocess_for_tokens(url))
             title_url_set = set(title_url_tokens)
             for chunk in chunks:
                 content_tokens = _tokenize(chunk)
                 tokens = content_tokens + title_url_tokens
-                base = _score(query_tokens, tokens)
+                base = _score(query_tokens_scored, tokens)
                 # Boost for title/url match (e.g., uploaded resume identifiers)
                 overlap = len(query_token_set.intersection(title_url_set))
                 # Small fuzzy bonus for minor typos (e.g., achivements -> achievements)
@@ -189,7 +205,12 @@ def search_data_dir(query: str, k: int = 5) -> List[Dict[str, Any]]:
                 for qt in query_tokens:
                     if _has_fuzzy_match(qt, tokens):
                         fuzzy_bonus += 0.5
-                s = base + (5.0 * overlap) + fuzzy_bonus
+                # Prefer uploaded docs slightly
+                uploaded_bonus = 2.0 if str(url).startswith("uploaded://") else 0.0
+                # Name/entity hint: if query contains tokens present in content (e.g., neha, pipada), add a small boost
+                name_overlap = len(set(t for t in query_tokens_scored if len(t) > 2).intersection(set(content_tokens)))
+                name_bonus = min(name_overlap, 3) * 0.8
+                s = base + (5.0 * overlap) + fuzzy_bonus + uploaded_bonus + name_bonus
                 if s > 0:
                     snippet = chunk[:1200]
                     candidates.append({

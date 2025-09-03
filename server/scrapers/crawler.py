@@ -153,7 +153,7 @@ def append_new_urls(accepted_file: str, rejected_file: str, new_accepted: set, n
                 f.write(f"{url}\n")
 
 
-async def crawl_website_enhanced(base_url: str, accepted_file: str, rejected_file: str, existing_accepted: set = None, existing_rejected: set = None, exclusion_urls: list = None):
+async def crawl_website_enhanced(base_url: str, accepted_file: str, rejected_file: str, existing_accepted: set = None, existing_rejected: set = None, exclusion_urls: list = None, progress_callback=None):
     if existing_accepted is None:
         existing_accepted = set()
     if existing_rejected is None:
@@ -171,6 +171,13 @@ async def crawl_website_enhanced(base_url: str, accepted_file: str, rejected_fil
     except ImportError:
         logger.warning("Enhanced scraper not available, falling back to basic HTTP")
         return crawl_website(base_url, accepted_file, rejected_file, existing_accepted, existing_rejected, exclusion_urls)
+
+    # initial progress callback
+    if progress_callback:
+        try:
+            progress_callback(0, len(to_visit), len(existing_accepted), len(existing_rejected), 0)
+        except Exception:
+            pass
 
     while to_visit:
         url = to_visit.pop(0)
@@ -221,6 +228,21 @@ async def crawl_website_enhanced(base_url: str, accepted_file: str, rejected_fil
                         continue
                     to_visit.append(absolute_url)
 
+                # progress update
+                if progress_callback:
+                    try:
+                        visited_count = len(visited)
+                        queue_count = len(to_visit)
+                        accepted_count = len(existing_accepted) + len(new_accepted)
+                        rejected_count = len(existing_rejected) + len(new_rejected)
+                        denom = max(visited_count + queue_count, 1)
+                        percent = int(visited_count * 100 / denom)
+                        if queue_count > 0 and percent >= 96:
+                            percent = 95
+                        progress_callback(visited_count, queue_count, accepted_count, rejected_count, percent)
+                    except Exception:
+                        pass
+
                 time.sleep(random.uniform(2, 5))
             else:
                 if url in new_accepted:
@@ -243,10 +265,21 @@ async def crawl_website_enhanced(base_url: str, accepted_file: str, rejected_fil
     else:
         logger.info("Enhanced crawler: No new URLs found")
 
+    # final progress
+    if progress_callback:
+        try:
+            visited_count = len(visited)
+            queue_count = len(to_visit)
+            accepted_count = len(existing_accepted) + len(new_accepted)
+            rejected_count = len(existing_rejected) + len(new_rejected)
+            progress_callback(visited_count, queue_count, accepted_count, rejected_count, 100)
+        except Exception:
+            pass
+
     return new_accepted, new_rejected
 
 
-def crawl_website(base_url: str, accepted_file: str, rejected_file: str, existing_accepted: set = None, existing_rejected: set = None, exclusion_urls: list = None):
+def crawl_website(base_url: str, accepted_file: str, rejected_file: str, existing_accepted: set = None, existing_rejected: set = None, exclusion_urls: list = None, progress_callback=None):
     if existing_accepted is None:
         existing_accepted = set()
     if existing_rejected is None:
@@ -268,6 +301,13 @@ def crawl_website(base_url: str, accepted_file: str, rejected_file: str, existin
     except Exception as e:
         logger.error(f"Failed to initialize session with {base_url}: {e}")
         return new_accepted, new_rejected
+
+    # initial progress callback
+    if progress_callback:
+        try:
+            progress_callback(0, len(to_visit), len(existing_accepted), len(existing_rejected), 0)
+        except Exception:
+            pass
 
     while to_visit:
         url = to_visit.pop(0)
@@ -323,6 +363,21 @@ def crawl_website(base_url: str, accepted_file: str, rejected_file: str, existin
                 if absolute_url not in visited:
                     to_visit.append(absolute_url)
 
+            # progress update
+            if progress_callback:
+                try:
+                    visited_count = len(visited)
+                    queue_count = len(to_visit)
+                    accepted_count = len(existing_accepted) + len(new_accepted)
+                    rejected_count = len(existing_rejected) + len(new_rejected)
+                    denom = max(visited_count + queue_count, 1)
+                    percent = int(visited_count * 100 / denom)
+                    if queue_count > 0 and percent >= 96:
+                        percent = 95
+                    progress_callback(visited_count, queue_count, accepted_count, rejected_count, percent)
+                except Exception:
+                    pass
+
             delay = random.uniform(5, 10)
             time.sleep(delay)
         except requests.exceptions.RequestException:
@@ -341,6 +396,17 @@ def crawl_website(base_url: str, accepted_file: str, rejected_file: str, existin
         logger.info(f"Added {len(new_rejected)} new URLs to {rejected_file}")
     else:
         logger.info("No new URLs found")
+
+    # final progress
+    if progress_callback:
+        try:
+            visited_count = len(visited)
+            queue_count = len(to_visit)
+            accepted_count = len(existing_accepted) + len(new_accepted)
+            rejected_count = len(existing_rejected) + len(new_rejected)
+            progress_callback(visited_count, queue_count, accepted_count, rejected_count, 100)
+        except Exception:
+            pass
 
     return new_accepted, new_rejected
 

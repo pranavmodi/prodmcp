@@ -538,14 +538,32 @@ async def crawl_website(request: CrawlRequest):
                 existing_accepted = load_existing_urls(accepted_file)
                 existing_rejected = load_existing_urls(rejected_file)
 
-                # Crawl (blocking in this thread)
-                crawl_urls(
-                    base_url=base_url,
-                    accepted_file=accepted_file,
-                    rejected_file=rejected_file,
-                    existing_accepted=existing_accepted,
-                    existing_rejected=existing_rejected,
-                    exclusion_urls=(exclusions or [])
+                # Crawl in a worker thread and stream progress back to event loop
+                loop = asyncio.get_running_loop()
+
+                def _crawl_progress(visited, queue, accepted, rejected, percent):
+                    def _update():
+                        _crawl_job["crawl"].update({
+                            "accepted": int(accepted),
+                            "rejected": int(rejected),
+                            "discovered": int(accepted) + int(rejected),
+                            "percent": int(percent),
+                        })
+                        _crawl_job["updated_at"] = loop.time()
+                    try:
+                        loop.call_soon_threadsafe(_update)
+                    except Exception:
+                        pass
+
+                await asyncio.to_thread(
+                    crawl_urls,
+                    base_url,
+                    accepted_file,
+                    rejected_file,
+                    existing_accepted,
+                    existing_rejected,
+                    (exclusions or []),
+                    _crawl_progress,
                 )
 
                 # Update crawl progress
@@ -555,7 +573,7 @@ async def crawl_website(request: CrawlRequest):
                 _crawl_job["crawl"]["discovered"] = _crawl_job["crawl"]["accepted"] + _crawl_job["crawl"]["rejected"]
                 _crawl_job["crawl"]["percent"] = 100
                 _crawl_job["status"] = "scrape"
-                _crawl_job["updated_at"] = asyncio.get_event_loop().time()
+                _crawl_job["updated_at"] = asyncio.get_running_loop().time()
 
                 # Scrape with progress callback
                 sorted_urls = sorted(all_accepted)
@@ -567,18 +585,18 @@ async def crawl_website(request: CrawlRequest):
                 async def _progress_callback(done: int, total_cb: int):
                     _crawl_job["scrape"]["completed"] = done
                     _crawl_job["scrape"]["percent"] = int(done * 100 / max(total_cb, 1))
-                    _crawl_job["updated_at"] = asyncio.get_event_loop().time()
+                    _crawl_job["updated_at"] = asyncio.get_running_loop().time()
 
                 if total > 0:
                     await server.scraper.scrape_urls_batch(sorted_urls, progress_callback=_progress_callback)
 
                 _crawl_job["status"] = "done"
                 _crawl_job["message"] = f"Crawled and scraped {base_url}"
-                _crawl_job["updated_at"] = asyncio.get_event_loop().time()
+                _crawl_job["updated_at"] = asyncio.get_running_loop().time()
             except Exception as e:
                 _crawl_job["status"] = "error"
                 _crawl_job["message"] = str(e)
-                _crawl_job["updated_at"] = asyncio.get_event_loop().time()
+                _crawl_job["updated_at"] = asyncio.get_running_loop().time()
 
         _crawl_task = asyncio.create_task(_run_job(request.url.strip(), (request.exclusions or [])))
 
