@@ -11,6 +11,7 @@ const Crawler = () => {
   const [pollId, setPollId] = useState(null);
   const [exclusions, setExclusions] = useState('');
   const [urls, setUrls] = useState({ accepted: [], rejected: [] });
+  const [tenantId, setTenantId] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState(null);
   const [uploadedFiles, setUploadedFiles] = useState([]);
@@ -37,18 +38,21 @@ const Crawler = () => {
       });
 
       setResult(response.data);
+      const tid = response?.data?.tenant_id || tenantId || 'default';
+      setTenantId(tid);
+      try { localStorage.setItem('tenant_id', tid); } catch (_) {}
       // Start polling progress
       if (pollId) {
         clearInterval(pollId);
       }
       const id = setInterval(async () => {
         try {
-          const { data } = await axios.get('http://localhost:8000/crawl/stats');
+          const { data } = await axios.get('http://localhost:8000/crawl/stats', { params: { tenant_id: tid } });
           const job = data?.crawl_stats || {};
           setProgress(job);
           // also poll discovered urls
           try {
-            const urlsRes = await axios.get('http://localhost:8000/crawl/urls');
+            const urlsRes = await axios.get('http://localhost:8000/crawl/urls', { params: { tenant_id: tid } });
             const accepted = urlsRes?.data?.accepted_urls || [];
             const rejected = urlsRes?.data?.rejected_urls || [];
             setUrls({ accepted, rejected });
@@ -82,15 +86,16 @@ const Crawler = () => {
       // use axios instance with baseURL for multipart since default apiService returns the instance too
       const formData = new FormData();
       formData.append('file', file);
-      await api.post('/upload', formData, { headers: { 'Content-Type': 'multipart/form-data' }});
+      const upUrl = tenantId ? `/upload?tenant_id=${encodeURIComponent(tenantId)}` : '/upload?tenant_id=default';
+      await api.post(upUrl, formData, { headers: { 'Content-Type': 'multipart/form-data' }});
       // refresh lists
       try {
-        const urlsRes = await axios.get('http://localhost:8000/crawl/urls');
+        const urlsRes = await axios.get('http://localhost:8000/crawl/urls', { params: { tenant_id: tenantId || 'default' } });
         const accepted = urlsRes?.data?.accepted_urls || [];
         const rejected = urlsRes?.data?.rejected_urls || [];
         setUrls({ accepted, rejected });
         // refresh uploaded list
-        const files = await apiService.listFiles();
+        const files = await api.get('/files', { params: { tenant_id: tenantId || 'default' } }).then(r => r.data);
         setUploadedFiles(files?.uploaded_files || []);
         setUploadedFilesMeta(files?.uploaded_files_meta || []);
       } catch (_) {}

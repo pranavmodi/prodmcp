@@ -28,6 +28,8 @@ from mcp_client import MCPStdIoClient, spawn_mcp_server
 import mimetypes
 import shutil
 from datetime import datetime
+from db import create_crawl_job, set_crawl_status
+import uuid
 
 # Load environment variables
 load_dotenv()
@@ -36,19 +38,23 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Global crawl job state
-_crawl_job = {
-    "status": "idle",  # idle | crawl | scrape | done | error
-    "message": None,
-    "crawl": {"accepted": 0, "rejected": 0, "discovered": 0, "percent": None},
-    "scrape": {"total": 0, "completed": 0, "percent": 0},
-    "started_at": None,
-    "updated_at": None,
-}
-_crawl_task: Optional[asyncio.Task] = None
+# Per-tenant crawl job state
+_crawl_jobs: Dict[str, dict] = {}
+_crawl_tasks: Dict[str, asyncio.Task] = {}
+
+def _empty_job_state() -> dict:
+    return {
+        "status": "idle",  # idle | crawl | scrape | done | error
+        "message": None,
+        "crawl": {"accepted": 0, "rejected": 0, "discovered": 0, "percent": 0},
+        "scrape": {"total": 0, "completed": 0, "percent": 0},
+        "started_at": None,
+        "updated_at": None,
+    }
 
 # Pydantic models for HTTP API
 class CrawlRequest(BaseModel):
+    tenant_id: Optional[str] = None
     url: str
     # Optional list of URL substrings or full URLs to exclude from crawling/scraping
     exclusions: Optional[List[str]] = None
@@ -59,14 +65,17 @@ class CrawlResponse(BaseModel):
     scraped_files: List[str] = []
     failed_urls: List[str] = []
     crawl_stats: dict = None
+    job_id: Optional[int] = None
+    tenant_id: Optional[str] = None
 
 class QuestionRequest(BaseModel):
+    tenant_id: Optional[str] = None
     question: str
 
 class QuestionResponse(BaseModel):
     answer: str
-    context_info: dict = None
-    mcp_debug: dict = None
+    context_info: Optional[dict] = None
+    mcp_debug: Optional[dict] = None
 
 class ErrorResponse(BaseModel):
     error: str
@@ -512,13 +521,18 @@ async def crawl_website(request: CrawlRequest):
 
         if not request.url or not request.url.strip():
             raise HTTPException(status_code=400, detail="URL is required")
+        # Generate random tenant_id if not provided or set to 'default'
+        tenant_raw = (request.tenant_id or "").strip()
+        tenant_id = uuid.uuid4().hex if (not tenant_raw or tenant_raw.lower() == "default") else tenant_raw
 
-        global _crawl_task, _crawl_job
-        if _crawl_task and not _crawl_task.done():
-            raise HTTPException(status_code=409, detail="A crawl is already in progress")
+        # Per-tenant job state
+        if tenant_id not in _crawl_jobs:
+            _crawl_jobs[tenant_id] = _empty_job_state()
+        if tenant_id in _crawl_tasks and _crawl_tasks[tenant_id] and not _crawl_tasks[tenant_id].done():
+            raise HTTPException(status_code=409, detail="A crawl is already in progress for this tenant")
 
-        # Reset job state
-        _crawl_job.update({
+        # Reset tenant job state
+        _crawl_jobs[tenant_id].update({
             "status": "crawl",
             "message": None,
             "crawl": {"accepted": 0, "rejected": 0, "discovered": 0, "percent": 0},
@@ -527,11 +541,12 @@ async def crawl_website(request: CrawlRequest):
             "updated_at": asyncio.get_event_loop().time(),
         })
 
-        async def _run_job(base_url: str, exclusions: Optional[List[str]]):
+        async def _run_job(base_url: str, exclusions: Optional[List[str]], tenant_id_local: str, job_id_local: Optional[int]):
             try:
-                server = MCPServer()
                 from crawler import crawl_website as crawl_urls, load_existing_urls
-                data_dir = os.getenv("DATA_DIR", "./scraped_pages")
+                base_dir = os.getenv("DATA_DIR", "./scraped_pages")
+                data_dir = os.path.join(base_dir, tenant_id_local)
+                os.makedirs(data_dir, exist_ok=True)
                 accepted_file = os.path.join(data_dir, "accepted_urls.txt")
                 rejected_file = os.path.join(data_dir, "rejected_urls.txt")
 
@@ -543,13 +558,13 @@ async def crawl_website(request: CrawlRequest):
 
                 def _crawl_progress(visited, queue, accepted, rejected, percent):
                     def _update():
-                        _crawl_job["crawl"].update({
+                        _crawl_jobs[tenant_id_local]["crawl"].update({
                             "accepted": int(accepted),
                             "rejected": int(rejected),
                             "discovered": int(accepted) + int(rejected),
                             "percent": int(percent),
                         })
-                        _crawl_job["updated_at"] = loop.time()
+                        _crawl_jobs[tenant_id_local]["updated_at"] = loop.time()
                     try:
                         loop.call_soon_threadsafe(_update)
                     except Exception:
@@ -564,48 +579,78 @@ async def crawl_website(request: CrawlRequest):
                     existing_rejected,
                     (exclusions or []),
                     _crawl_progress,
+                    data_dir,
                 )
 
                 # Update crawl progress
                 all_accepted = load_existing_urls(accepted_file)
-                _crawl_job["crawl"]["accepted"] = len(all_accepted)
-                _crawl_job["crawl"]["rejected"] = len(load_existing_urls(rejected_file))
-                _crawl_job["crawl"]["discovered"] = _crawl_job["crawl"]["accepted"] + _crawl_job["crawl"]["rejected"]
-                _crawl_job["crawl"]["percent"] = 100
-                _crawl_job["status"] = "scrape"
-                _crawl_job["updated_at"] = asyncio.get_running_loop().time()
+                _crawl_jobs[tenant_id_local]["crawl"]["accepted"] = len(all_accepted)
+                _crawl_jobs[tenant_id_local]["crawl"]["rejected"] = len(load_existing_urls(rejected_file))
+                _crawl_jobs[tenant_id_local]["crawl"]["discovered"] = _crawl_jobs[tenant_id_local]["crawl"]["accepted"] + _crawl_jobs[tenant_id_local]["crawl"]["rejected"]
+                _crawl_jobs[tenant_id_local]["crawl"]["percent"] = 100
+                _crawl_jobs[tenant_id_local]["status"] = "scrape"
+                _crawl_jobs[tenant_id_local]["updated_at"] = asyncio.get_running_loop().time()
 
-                # Scrape with progress callback
+                # Scrape with progress callback (run in background thread to avoid blocking event loop)
                 sorted_urls = sorted(all_accepted)
                 total = len(sorted_urls)
-                _crawl_job["scrape"]["total"] = total
-                _crawl_job["scrape"]["completed"] = 0
-                _crawl_job["scrape"]["percent"] = 0 if total == 0 else 0
+                _crawl_jobs[tenant_id_local]["scrape"]["total"] = total
+                _crawl_jobs[tenant_id_local]["scrape"]["completed"] = 0
+                _crawl_jobs[tenant_id_local]["scrape"]["percent"] = 0 if total == 0 else 0
 
-                async def _progress_callback(done: int, total_cb: int):
-                    _crawl_job["scrape"]["completed"] = done
-                    _crawl_job["scrape"]["percent"] = int(done * 100 / max(total_cb, 1))
-                    _crawl_job["updated_at"] = asyncio.get_running_loop().time()
+                loop = asyncio.get_running_loop()
+
+                async def _progress_callback_async(done: int, total_cb: int):
+                    def _update():
+                        _crawl_jobs[tenant_id_local]["scrape"]["completed"] = done
+                        _crawl_jobs[tenant_id_local]["scrape"]["percent"] = int(done * 100 / max(total_cb, 1))
+                        _crawl_jobs[tenant_id_local]["updated_at"] = loop.time()
+                    try:
+                        loop.call_soon_threadsafe(_update)
+                    except Exception:
+                        pass
+
+                def _run_scrape_blocking():
+                    import asyncio as _asyncio
+                    from scraper import ModernScraper
+                    scraper = ModernScraper(output_dir=data_dir)
+                    _asyncio.run(scraper.scrape_urls_batch(sorted_urls, progress_callback=_progress_callback_async))
 
                 if total > 0:
-                    await server.scraper.scrape_urls_batch(sorted_urls, progress_callback=_progress_callback)
+                    await asyncio.to_thread(_run_scrape_blocking)
 
-                _crawl_job["status"] = "done"
-                _crawl_job["message"] = f"Crawled and scraped {base_url}"
-                _crawl_job["updated_at"] = asyncio.get_running_loop().time()
+                _crawl_jobs[tenant_id_local]["status"] = "done"
+                _crawl_jobs[tenant_id_local]["message"] = f"Crawled and scraped {base_url}"
+                _crawl_jobs[tenant_id_local]["updated_at"] = asyncio.get_running_loop().time()
+                try:
+                    set_crawl_status(int(job_id_local or 0), "done", f"Crawled and scraped {base_url}", finished=True)
+                except Exception:
+                    pass
             except Exception as e:
-                _crawl_job["status"] = "error"
-                _crawl_job["message"] = str(e)
-                _crawl_job["updated_at"] = asyncio.get_running_loop().time()
+                _crawl_jobs[tenant_id_local]["status"] = "error"
+                _crawl_jobs[tenant_id_local]["message"] = str(e)
+                _crawl_jobs[tenant_id_local]["updated_at"] = asyncio.get_running_loop().time()
+                try:
+                    set_crawl_status(int(job_id_local or 0), "error", str(e), finished=True)
+                except Exception:
+                    pass
 
-        _crawl_task = asyncio.create_task(_run_job(request.url.strip(), (request.exclusions or [])))
+        job_id: Optional[int] = None
+        try:
+            job_id = create_crawl_job(tenant_id=tenant_id, url=request.url.strip(), status="started")
+        except Exception as e:
+            logger.warning(f"DB: failed to create crawl job: {e}")
+
+        _crawl_tasks[tenant_id] = asyncio.create_task(_run_job(request.url.strip(), (request.exclusions or []), tenant_id, job_id))
 
         return CrawlResponse(
             status="started",
             message="Crawl job started",
             scraped_files=[],
             failed_urls=[],
-            crawl_stats={}
+            crawl_stats=_crawl_jobs[tenant_id],
+            job_id=job_id,
+            tenant_id=tenant_id,
         )
 
     except HTTPException:
@@ -620,84 +665,44 @@ async def ask_question(request: QuestionRequest):
     try:
         if not request.question or not request.question.strip():
             raise HTTPException(status_code=400, detail="Question is required")
+        logger.info(f"Question received: {request.question[:50]}...")
 
-        logger.info(f"Question received (MCP): {request.question[:50]}...")
+        # For asking, do NOT generate a new tenant. Use provided tenant_id or 'default'
+        tenant_id = (request.tenant_id or "default").strip() or "default"
 
-        # Spawn MCP server (stdio-only) and call the lookup_kb tool via MCP client
-        proc = await spawn_mcp_server(project_root=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-        client = MCPStdIoClient(proc)
+        # Run KB lookup in a worker thread to avoid blocking the event loop or crawl job
+        def _run_lookup_sync(q: str, data_dir: str):
+            from kb import lookup_kb_minimal
+            return lookup_kb_minimal(q, k=10, data_dir=data_dir)
 
-        try:
-            # Prepare debug payload
-            mcp_debug = {
-                "client": {
-                    "spawned": True,
-                    "pid": proc.pid,
-                },
-                "server": {},
-                "tool": {
-                    "name": "lookup_kb",
-                    "args": {"k": 5, "queryLength": len(request.question.strip())}
-                }
-            }
+        base_dir = os.getenv("DATA_DIR", "./scraped_pages")
+        tenant_dir = os.path.join(base_dir, tenant_id)
+        os.makedirs(tenant_dir, exist_ok=True)
+        result = await asyncio.to_thread(_run_lookup_sync, request.question.strip(), tenant_dir)
 
-            init_result = await client.initialize()
-            mcp_debug["server"] = {
-                "protocolVersion": init_result.get("protocolVersion"),
-                "serverInfo": init_result.get("serverInfo"),
-                "capabilities": init_result.get("capabilities")
-            }
-
-            tool_args = {"query": request.question.strip(), "k": 10}
-            tool_result = await client.tools_call("lookup_kb", tool_args)
-
-            # Handle tool errors surfaced via result
-            if tool_result.get("isError"):
-                err = tool_result.get("error") or {}
-                message = err.get("message") or "Tool call failed"
-                raise HTTPException(status_code=500, detail=message)
-
-            # Extract answer and construct context_info compatible with the frontend
-            metadata = tool_result.get("metadata") or {}
-            answer = metadata.get("answer")
-
-            if not answer:
-                contents = tool_result.get("content") or []
-                texts = [c.get("text", "") for c in contents if isinstance(c, dict) and c.get("type") == "text"]
-                answer = "\n".join([t for t in texts if t]) or "No answer returned."
-
-            citations = metadata.get("citations") or []
-            context_info = {
-                "total_files": len(citations),
-                "files": [
-                    {
-                        "filename": (c.get("url") or c.get("title") or "unknown")
-                    }
-                    for c in citations if isinstance(c, dict)
-                ]
-            }
-
-            # Fill tool debug
-            mcp_debug["tool"].update({
-                "success": True,
-                "contentCount": len(tool_result.get("content") or []),
-                "metadataKeys": list((tool_result.get("metadata") or {}).keys()),
-            })
-
-            logger.info("Question answered successfully via MCP")
-
+        citations = result.get("citations") or []
+        answer = (result.get("answer") or "").strip()
+        # Strict guardrail: if no citations or no answer text, return a neutral refusal
+        if not citations or not answer:
+            fallback = "The context provided does not mention this topic. Therefore, I cannot provide an answer regarding it."
             return QuestionResponse(
-                answer=answer,
-                context_info=context_info,
-                mcp_debug=mcp_debug
+                answer=fallback,
+                context_info={"total_files": 0, "files": []},
+                mcp_debug=None,
             )
-        finally:
-            try:
-                proc.terminate()
-            except ProcessLookupError:
-                pass
-            await proc.wait()
-        
+        context_info = {
+            "total_files": len(citations),
+            "files": [
+                {"filename": (c.get("url") or c.get("title") or "unknown")} for c in citations if isinstance(c, dict)
+            ]
+        }
+
+        return QuestionResponse(
+            answer=answer,
+            context_info=context_info,
+            mcp_debug=None
+        )
+    
     except HTTPException:
         raise
     except Exception as e:
@@ -705,12 +710,15 @@ async def ask_question(request: QuestionRequest):
         raise HTTPException(status_code=500, detail=f"Failed to process question: {str(e)}")
 
 @app.get("/files")
-async def list_files():
+async def list_files(tenant_id: Optional[str] = "default"):
     """List all scraped HTML files."""
     try:
-        # Create a temporary server instance
-        temp_server = MCPServer()
-        storage_info = temp_server.storage.get_storage_info()
+        tenant_id = (tenant_id or "default").strip() or "default"
+        from storage import HTMLStorage
+        base_dir = os.getenv("DATA_DIR", "./scraped_pages")
+        data_dir = os.path.join(base_dir, tenant_id)
+        storage = HTMLStorage(data_dir)
+        storage_info = storage.get_storage_info()
 
         # Detect uploaded documents by reading json metadata/url
         uploaded_files: list[str] = []
@@ -748,22 +756,24 @@ async def list_files():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/crawl/stats")
-async def get_crawl_stats():
+async def get_crawl_stats(tenant_id: Optional[str] = "default"):
     """Get statistics about the crawling operation."""
     try:
-        return {
-            "status": "success",
-            "crawl_stats": _crawl_job
-        }
+        tenant_id = (tenant_id or "default").strip() or "default"
+        if tenant_id not in _crawl_jobs:
+            _crawl_jobs[tenant_id] = _empty_job_state()
+        return {"status": "success", "crawl_stats": _crawl_jobs[tenant_id]}
     except Exception as e:
         logger.error(f"Error getting crawl stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/crawl/urls")
-async def get_discovered_urls():
+async def get_discovered_urls(tenant_id: Optional[str] = "default"):
     """Get the currently discovered accepted and rejected URLs."""
     try:
-        data_dir = os.getenv("DATA_DIR", "./scraped_pages")
+        tenant_id = (tenant_id or "default").strip() or "default"
+        base_dir = os.getenv("DATA_DIR", "./scraped_pages")
+        data_dir = os.path.join(base_dir, tenant_id)
         accepted_file = os.path.join(data_dir, "accepted_urls.txt")
         rejected_file = os.path.join(data_dir, "rejected_urls.txt")
         from crawler import load_existing_urls
@@ -783,10 +793,12 @@ async def get_discovered_urls():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/crawl/clear")
-async def clear_crawl_data():
+async def clear_crawl_data(tenant_id: Optional[str] = "default"):
     """Clear all crawl data and start fresh."""
     try:
-        data_dir = os.getenv("DATA_DIR", "./scraped_pages")
+        tenant_id = (tenant_id or "default").strip() or "default"
+        base_dir = os.getenv("DATA_DIR", "./scraped_pages")
+        data_dir = os.path.join(base_dir, tenant_id)
         for name in ["accepted_urls.txt", "rejected_urls.txt", "crawler_cookies.txt"]:
             path = os.path.join(data_dir, name)
             try:
@@ -803,7 +815,7 @@ async def clear_crawl_data():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(file: UploadFile = File(...), tenant_id: Optional[str] = None):
     """Upload a .txt, .docx, or .pdf file and store as JSON in DATA_DIR so KB can use it."""
     try:
         if not file:
@@ -815,10 +827,14 @@ async def upload_file(file: UploadFile = File(...)):
         if ext not in allowed:
             raise HTTPException(status_code=400, detail="Only .txt, .docx, .pdf are allowed")
 
+        # Resolve tenant-scoped directory
+        base_dir = os.getenv("DATA_DIR", "./scraped_pages")
+        tenant_raw = (tenant_id or "").strip()
+        final_tenant = uuid.uuid4().hex if (not tenant_raw or tenant_raw.lower() == "default") else tenant_raw
+        data_dir = Path(base_dir) / final_tenant
+        data_dir.mkdir(parents=True, exist_ok=True)
         # Save to temp
-        data_dir = os.getenv("DATA_DIR", "./scraped_pages")
-        Path(data_dir).mkdir(parents=True, exist_ok=True)
-        tmp_path = Path(data_dir) / f"_upload_tmp_{datetime.utcnow().timestamp()}_{filename}"
+        tmp_path = data_dir / f"_upload_tmp_{datetime.utcnow().timestamp()}_{filename}"
         with open(tmp_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
@@ -874,9 +890,9 @@ async def upload_file(file: UploadFile = File(...)):
             },
         }
 
-        # Reuse scraper save path convention
+        # Reuse scraper save path convention (tenant-scoped output_dir)
         from scrapers.enhanced_scraper import SimpleHTTPScraper
-        saver = SimpleHTTPScraper()
+        saver = SimpleHTTPScraper(output_dir=data_dir)
         saved_path = await saver.save_content(content, pseudo_url)
 
         return {
@@ -884,6 +900,7 @@ async def upload_file(file: UploadFile = File(...)):
             "message": "File uploaded and indexed",
             "file": filename,
             "stored": saved_path,
+            "tenant_id": final_tenant,
         }
     except HTTPException:
         raise

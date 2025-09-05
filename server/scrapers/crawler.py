@@ -31,17 +31,17 @@ HEADERS = {
 }
 
 
-def _cookie_file_path() -> str:
-    data_dir = os.getenv("DATA_DIR", "./scraped_pages")
+def _cookie_file_path(data_dir: str | None = None) -> str:
+    data_dir = data_dir or os.getenv("DATA_DIR", "./scraped_pages")
     Path(data_dir).mkdir(parents=True, exist_ok=True)
     return str(Path(data_dir) / "crawler_cookies.txt")
 
 
-def create_session():
+def create_session(data_dir: str | None = None):
     """Create a session with retry strategy and cookie persistence"""
     session = requests.Session()
 
-    cookie_path = _cookie_file_path()
+    cookie_path = _cookie_file_path(data_dir)
     cookie_jar = LWPCookieJar(cookie_path)
     try:
         cookie_jar.load(ignore_discard=True)
@@ -279,7 +279,7 @@ async def crawl_website_enhanced(base_url: str, accepted_file: str, rejected_fil
     return new_accepted, new_rejected
 
 
-def crawl_website(base_url: str, accepted_file: str, rejected_file: str, existing_accepted: set = None, existing_rejected: set = None, exclusion_urls: list = None, progress_callback=None):
+def crawl_website(base_url: str, accepted_file: str, rejected_file: str, existing_accepted: set = None, existing_rejected: set = None, exclusion_urls: list = None, progress_callback=None, data_dir: str | None = None):
     if existing_accepted is None:
         existing_accepted = set()
     if existing_rejected is None:
@@ -290,7 +290,7 @@ def crawl_website(base_url: str, accepted_file: str, rejected_file: str, existin
     new_accepted = set()
     new_rejected = set()
 
-    session, cookie_jar = create_session()
+    session, cookie_jar = create_session(data_dir)
 
     try:
         logger.info(f"Initializing session with {base_url}")

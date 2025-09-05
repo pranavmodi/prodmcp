@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react'
+import { useLocation } from 'react-router-dom'
 import { MessageCircle, Send, Bot, User, AlertCircle, Info, ArrowLeft } from 'lucide-react'
 import { apiService } from '../services/api'
 import Loader from '../components/Loader'
@@ -10,15 +11,23 @@ const Ask = () => {
   const [conversation, setConversation] = useState([])
   const [error, setError] = useState(null)
   const [availableFiles, setAvailableFiles] = useState(null)
+  const [tenantId, setTenantId] = useState(null)
+
+  const location = useLocation()
 
   useEffect(() => {
+    // read tenant_id from query string or localStorage
+    const params = new URLSearchParams(location.search)
+    const tid = params.get('tenant_id') || localStorage.getItem('tenant_id') || 'default'
+    setTenantId(tid)
     // Load available files on component mount
     loadAvailableFiles()
-  }, [])
+  }, [location.search])
 
   const loadAvailableFiles = async () => {
     try {
-      const files = await apiService.listFiles()
+      const tid = tenantId || localStorage.getItem('tenant_id') || 'default'
+      const files = await apiService.listFiles(tid)
       setAvailableFiles(files)
     } catch (error) {
       console.error('Failed to load files:', error)
@@ -51,7 +60,8 @@ const Ask = () => {
     setConversation(prev => [...prev, userMessage])
 
     try {
-      const response = await apiService.askQuestion(userQuestion)
+      const tid = tenantId || localStorage.getItem('tenant_id') || 'default'
+      const response = await apiService.askQuestion(userQuestion, tid)
       
       // Add AI response to conversation
       const aiMessage = {

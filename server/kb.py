@@ -172,8 +172,8 @@ def _iter_scraped_json_files(data_dir: str) -> List[Path]:
     return files
 
 
-def search_data_dir(query: str, k: int = 5) -> List[Dict[str, Any]]:
-    data_dir = os.getenv("DATA_DIR", "./scraped_pages")
+def search_data_dir(query: str, k: int = 5, data_dir: str | None = None) -> List[Dict[str, Any]]:
+    data_dir = data_dir or os.getenv("DATA_DIR", "./scraped_pages")
     query_tokens = _tokenize(query)
     # Use content-bearing tokens for scoring
     query_tokens_scored = [t for t in query_tokens if t not in _STOPWORDS and len(t) > 2]
@@ -226,15 +226,15 @@ def search_data_dir(query: str, k: int = 5) -> List[Dict[str, Any]]:
     return candidates[:k]
 
 
-def lookup_kb_minimal(query: str, k: int = 5) -> Dict[str, Any]:
+def lookup_kb_minimal(query: str, k: int = 5, data_dir: str | None = None) -> Dict[str, Any]:
     """
     Minimal KB lookup: retrieve top-k JSON documents by simple lexical score.
     If OPENAI_API_KEY is set, generate a grounded answer using the snippets; otherwise, return extractive summary.
     """
-    top = search_data_dir(query, k=k)
+    top = search_data_dir(query, k=k, data_dir=data_dir)
     if not top:
         return {
-            "answer": "No relevant information found in the local knowledge base.",
+            "answer": "",
             "citations": [],
             "confidence": 0.0,
         }
@@ -251,7 +251,7 @@ def lookup_kb_minimal(query: str, k: int = 5) -> Dict[str, Any]:
         # Extractive fallback: concatenate snippets
         joined = _extractive_answer(query, top) or "\n\n".join(doc["snippet"] for doc in top)
         return {
-            "answer": joined[:1200],
+            "answer": joined[:1200] if joined.strip() else "",
             "citations": citations,
             "confidence": 0.4,
         }
@@ -285,14 +285,14 @@ def lookup_kb_minimal(query: str, k: int = 5) -> Dict[str, Any]:
             if extracted:
                 answer = extracted[:1200]
         return {
-            "answer": answer,
+            "answer": answer if (answer and answer.strip()) else "",
             "citations": citations,
             "confidence": 0.7,
         }
     except Exception:
         joined = "\n\n".join(doc["snippet"] for doc in top)
         return {
-            "answer": joined[:1200],
+            "answer": joined[:1200] if joined.strip() else "",
             "citations": citations,
             "confidence": 0.4,
         }

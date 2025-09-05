@@ -1,9 +1,30 @@
 import React from 'react'
 import { Link, useLocation } from 'react-router-dom'
+import api from '../services/api'
 import { Globe, MessageCircle } from 'lucide-react'
 
 const Navbar = () => {
   const location = useLocation()
+  const [crawlStatus, setCrawlStatus] = React.useState({ status: 'idle', crawl: { percent: 0 }, scrape: { percent: 0 } })
+
+  React.useEffect(() => {
+    let timer = null
+    const poll = async () => {
+      try {
+        const { data } = await api.get('/crawl/stats')
+        const job = data?.crawl_stats || {}
+        setCrawlStatus(job)
+      } catch (e) {
+        // ignore
+      }
+    }
+    // start polling every 1s so progress is visible across tabs
+    poll()
+    timer = setInterval(poll, 1000)
+    return () => {
+      if (timer) clearInterval(timer)
+    }
+  }, [])
 
   const isActive = (path) => {
     return location.pathname === path
@@ -48,6 +69,19 @@ const Navbar = () => {
                 <span>Ask</span>
               </div>
             </Link>
+
+            {/* Global Crawl Indicator */}
+            {crawlStatus?.status && crawlStatus.status !== 'idle' && (
+              <div className="ml-3 px-3 py-1 text-xs rounded-full bg-gray-100 text-gray-700 border">
+                <span className="font-medium">{crawlStatus.status === 'crawl' ? 'Crawling' : crawlStatus.status === 'scrape' ? 'Scraping' : crawlStatus.status}</span>
+                {typeof crawlStatus?.crawl?.percent === 'number' && (
+                  <span className="ml-2">{crawlStatus.crawl.percent}%</span>
+                )}
+                {typeof crawlStatus?.scrape?.percent === 'number' && crawlStatus.scrape.percent > 0 && (
+                  <span className="ml-2">| {crawlStatus.scrape.percent}%</span>
+                )}
+              </div>
+            )}
           </div>
         </div>
       </div>

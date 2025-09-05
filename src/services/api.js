@@ -68,9 +68,10 @@ export const apiService = {
   },
 
   // Ask a question
-  async askQuestion(question) {
+  async askQuestion(question, tenantId) {
     try {
-      const response = await api.post('/ask', { question })
+      const payload = tenantId ? { tenant_id: tenantId, question } : { tenant_id: 'default', question }
+      const response = await api.post('/ask', payload)
       const data = response.data
       if (data?.mcp_debug) {
         console.log('[MCP DEBUG] client', data.mcp_debug.client)
@@ -94,9 +95,9 @@ export const apiService = {
   },
 
   // List scraped files
-  async listFiles() {
+  async listFiles(tenantId) {
     try {
-      const response = await api.get('/files')
+      const response = await api.get('/files', { params: { tenant_id: tenantId || 'default' } })
       return response.data
     } catch (error) {
       throw error
