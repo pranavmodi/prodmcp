@@ -54,3 +54,9 @@ def set_crawl_status(job_id: int, status: str, message: Optional[str] = None, fi
         session.commit()
 
 
+# Ensure tables exist (safe no-op if already created)
+try:
+    Base.metadata.create_all(bind=engine)
+except Exception:
+    pass
+
