@@ -226,7 +226,7 @@ def search_data_dir(query: str, k: int = 5, data_dir: str | None = None) -> List
     return candidates[:k]
 
 
-def lookup_kb_minimal(query: str, k: int = 5, data_dir: str | None = None) -> Dict[str, Any]:
+def lookup_kb_minimal(query: str, k: int = 5, data_dir: str | None = None, retrieve_only: bool = False) -> Dict[str, Any]:
     """
     Minimal KB lookup: retrieve top-k JSON documents by simple lexical score.
     If OPENAI_API_KEY is set, generate a grounded answer using the snippets; otherwise, return extractive summary.
@@ -245,6 +245,16 @@ def lookup_kb_minimal(query: str, k: int = 5, data_dir: str | None = None) -> Di
             "url": doc.get("url") or doc.get("path"),
             "title": doc.get("title", ""),
         })
+
+    # If retrieval-only mode, return top docs and snippets without generation
+    if retrieve_only:
+        return {
+            "answer": "",
+            "citations": citations,
+            "confidence": 0.0,
+            "snippets": [d.get("snippet", "") for d in top],
+            "top": top,
+        }
 
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:

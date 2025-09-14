@@ -29,7 +29,7 @@ const Crawler = () => {
     setResult(null);
 
     try {
-      const response = await axios.post('http://localhost:8000/crawl', {
+      const response = await api.post('/crawl', {
         url: url.trim(),
         exclusions: exclusions
           .split(/\n|,/)
@@ -47,12 +47,12 @@ const Crawler = () => {
       }
       const id = setInterval(async () => {
         try {
-          const { data } = await axios.get('http://localhost:8000/crawl/stats', { params: { tenant_id: tid } });
+          const { data } = await api.get('/crawl/stats', { params: { tenant_id: tid } });
           const job = data?.crawl_stats || {};
           setProgress(job);
           // also poll discovered urls
           try {
-            const urlsRes = await axios.get('http://localhost:8000/crawl/urls', { params: { tenant_id: tid } });
+            const urlsRes = await api.get('/crawl/urls', { params: { tenant_id: tid } });
             const accepted = urlsRes?.data?.accepted_urls || [];
             const rejected = urlsRes?.data?.rejected_urls || [];
             setUrls({ accepted, rejected });
@@ -90,7 +90,7 @@ const Crawler = () => {
       await api.post(upUrl, formData, { headers: { 'Content-Type': 'multipart/form-data' }});
       // refresh lists
       try {
-        const urlsRes = await axios.get('http://localhost:8000/crawl/urls', { params: { tenant_id: tenantId || 'default' } });
+        const urlsRes = await api.get('/crawl/urls', { params: { tenant_id: tenantId || 'default' } });
         const accepted = urlsRes?.data?.accepted_urls || [];
         const rejected = urlsRes?.data?.rejected_urls || [];
         setUrls({ accepted, rejected });

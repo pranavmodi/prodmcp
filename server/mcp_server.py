@@ -125,6 +125,10 @@ class MCPServer:
                             "type": "string",
                             "description": "The user's question"
                         },
+                        "tenant_id": {
+                            "type": "string",
+                            "description": "Tenant ID to scope the KB directory (scraped_pages/<tenant_id>)"
+                        },
                         "k": {
                             "type": "integer",
                             "description": "Top documents to retrieve",
@@ -132,6 +136,36 @@ class MCPServer:
                         }
                     },
                     "required": ["query"]
+                }
+            },
+            {
+                "name": "scrape_website",
+                "description": "Crawl and scrape a site for a tenant; builds the tenant knowledge base",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tenant_id": {"type": "string", "description": "Tenant identifier"},
+                        "url": {"type": "string", "description": "Base URL to crawl"},
+                        "excluded_urls": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional list of URL prefixes to exclude"
+                        }
+                    },
+                    "required": ["tenant_id", "url"]
+                }
+            },
+            {
+                "name": "search_knowledge_base",
+                "description": "Search tenant knowledge base and return top snippets + citations",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tenant_id": {"type": "string", "description": "Tenant identifier"},
+                        "query": {"type": "string", "description": "User query to retrieve relevant snippets"},
+                        "k": {"type": "integer", "description": "Top-K to retrieve", "default": 5}
+                    },
+                    "required": ["tenant_id", "query"]
                 }
             }
         ]
@@ -160,6 +194,10 @@ class MCPServer:
         try:
             if name == "lookup_kb":
                 return await self._lookup_kb(arguments)
+            if name == "scrape_website":
+                return await self._tool_scrape_website(arguments)
+            if name == "search_knowledge_base":
+                return await self._tool_search_kb(arguments)
             else:
                 raise ValueError(f"Unknown tool: {name}")
         except Exception as e:
@@ -452,6 +490,107 @@ class MCPServer:
             }
         }
 
+    async def _tool_scrape_website(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP tool: crawl+scrape for a tenant and build FAISS index."""
+        tenant_id = (arguments.get("tenant_id") or "").strip() or uuid.uuid4().hex
+        url = (arguments.get("url") or "").strip()
+        exclusions = arguments.get("excluded_urls") or []
+        if not url:
+            return {
+                "content": [{"type": "text", "text": "url is required"}],
+                "isError": True,
+                "toolCallId": "scrape_website_error",
+                "metadata": {"code": -32602}
+            }
+
+        base_dir = os.getenv("DATA_DIR", "./scraped_pages")
+        data_dir = os.path.join(base_dir, tenant_id)
+        os.makedirs(data_dir, exist_ok=True)
+        accepted_file = os.path.join(data_dir, "accepted_urls.txt")
+        rejected_file = os.path.join(data_dir, "rejected_urls.txt")
+
+        from crawler import load_existing_urls, crawl_website as crawl_urls
+        existing_accepted = load_existing_urls(accepted_file)
+        existing_rejected = load_existing_urls(rejected_file)
+
+        # Crawl synchronously in thread
+        await asyncio.to_thread(
+            crawl_urls,
+            url,
+            accepted_file,
+            rejected_file,
+            existing_accepted,
+            existing_rejected,
+            list(exclusions),
+            None,
+            data_dir,
+        )
+
+        # Scrape
+        all_accepted = sorted(load_existing_urls(accepted_file))
+        scraped_files: List[str] = []
+        failed_urls: List[str] = []
+
+        if all_accepted:
+            def _run_scrape_blocking(urls: List[str], output_dir: str):
+                import asyncio as _asyncio
+                from scraper import ModernScraper
+                scraper = ModernScraper(output_dir=output_dir)
+                return _asyncio.run(scraper.scrape_urls_batch(urls))
+
+            results = await asyncio.to_thread(_run_scrape_blocking, all_accepted, data_dir)
+            scraped_files = [r.get("url") for r in results if r]
+            failed_urls = [u for u in all_accepted if u not in scraped_files]
+
+        # Build FAISS (best-effort)
+        try:
+            from vector_store import FAISSStore
+            store = FAISSStore(tenant_id=tenant_id)
+            store.build()
+        except Exception:
+            pass
+
+        return {
+            "content": [
+                {"type": "text", "text": f"Crawled {url}. Scraped {len(scraped_files)} pages. Failed {len(failed_urls)}."}
+            ],
+            "isError": False,
+            "toolCallId": "scrape_website_result",
+            "metadata": {
+                "tenant_id": tenant_id,
+                "accepted_total": len(all_accepted),
+                "rejected_total": len(load_existing_urls(rejected_file)),
+                "scraped_total": len(scraped_files),
+                "failed_total": len(failed_urls),
+            }
+        }
+
+    async def _tool_search_kb(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP tool: search tenant KB and return snippets + citations."""
+        tenant_id = (arguments.get("tenant_id") or "").strip() or "default"
+        query = (arguments.get("query") or "").strip()
+        k = int(arguments.get("k", 5))
+        if not query:
+            return {
+                "content": [{"type": "text", "text": "query is required"}],
+                "isError": True,
+                "toolCallId": "search_kb_error",
+                "metadata": {"code": -32602}
+            }
+        base_dir = os.getenv("DATA_DIR", "./scraped_pages")
+        data_dir = os.path.join(base_dir, tenant_id)
+        os.makedirs(data_dir, exist_ok=True)
+        from kb import lookup_kb_minimal
+        res = lookup_kb_minimal(query, k=k, data_dir=data_dir, retrieve_only=True)
+        snippets = res.get("snippets", []) or []
+        citations = res.get("citations", []) or []
+        return {
+            "content": [{"type": "text", "text": f"Retrieved {len(snippets)} snippets"}],
+            "isError": False,
+            "toolCallId": "search_kb_result",
+            "metadata": {"snippets": snippets, "citations": citations, "k": k}
+        }
+
     async def _lookup_kb(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Lookup knowledge base from local scraped JSON using a minimal RAG approach."""
         query = arguments.get("query")
@@ -459,7 +598,13 @@ class MCPServer:
             raise ValueError("query is required")
         k = int(arguments.get("k", 5))
         from kb import lookup_kb_minimal
-        result = lookup_kb_minimal(query, k=k)
+        # Optional tenant scoping
+        tenant_id = (arguments.get("tenant_id") or "").strip()
+        data_dir = None
+        if tenant_id:
+            base_dir = os.getenv("DATA_DIR", "./scraped_pages")
+            data_dir = os.path.join(base_dir, tenant_id)
+        result = lookup_kb_minimal(query, k=k, data_dir=data_dir)
         text = result.get("answer", "")
         return {
             "content": [
@@ -637,7 +782,7 @@ async def crawl_website(request: CrawlRequest):
 
         job_id: Optional[int] = None
         try:
-            job_id = create_crawl_job(tenant_id=tenant_id, url=request.url.strip(), status="started")
+            job_id = create_crawl_job(tenant_id=tenant_id, url=request.url.strip(), status="started", exclusions=(request.exclusions or []))
         except Exception as e:
             logger.warning(f"DB: failed to create crawl job: {e}")
 

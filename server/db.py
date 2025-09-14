@@ -1,4 +1,5 @@
 import os
+import json
 from typing import Optional
 
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, func
@@ -28,11 +29,24 @@ class CrawlJob(Base):
     message = Column(Text, nullable=True)
     started_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     finished_at = Column(DateTime(timezone=True), nullable=True)
+    exclusions = Column(Text, nullable=True)
 
 
-def create_crawl_job(tenant_id: str, url: str, status: str = "started") -> int:
+def create_crawl_job(tenant_id: str, url: str, status: str = "started", exclusions: Optional[list[str] | str] = None) -> int:
     with SessionLocal() as session:
-        job = CrawlJob(tenant_id=tenant_id, url=url, status=status)
+        exclusions_str: Optional[str] = None
+        if exclusions:
+            if isinstance(exclusions, str):
+                exclusions_str = exclusions
+            else:
+                try:
+                    exclusions_str = json.dumps(list(exclusions))
+                except Exception:
+                    try:
+                        exclusions_str = ",".join([str(x) for x in exclusions])
+                    except Exception:
+                        exclusions_str = None
+        job = CrawlJob(tenant_id=tenant_id, url=url, status=status, exclusions=exclusions_str)
         session.add(job)
         session.commit()
         session.refresh(job)
