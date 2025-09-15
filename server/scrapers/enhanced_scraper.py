@@ -214,7 +214,21 @@ class SimpleHTTPScraper:
     async def save_content(self, content: Dict, url: str) -> Optional[str]:
         try:
             parsed = urlparse(url)
-            filename = f"{parsed.netloc}{parsed.path}".replace('/', '_').replace(':', '_')
+            # Build a filename that preserves path, query, and fragment to avoid collisions
+            raw = f"{parsed.netloc}{parsed.path}"
+            if parsed.query:
+                raw += f"?{parsed.query}"
+            if parsed.fragment:
+                raw += f"#{parsed.fragment}"
+            # Sanitize to filesystem-friendly string
+            filename = (
+                raw.replace('/', '_')
+                   .replace(':', '_')
+                   .replace('?', '_')
+                   .replace('&', '_')
+                   .replace('=', '_')
+                   .replace('#', '_')
+            )
             if filename.endswith('_'):
                 filename = filename[:-1]
             filename = f"{filename}.json"

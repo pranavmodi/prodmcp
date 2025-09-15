@@ -55,11 +55,16 @@ class FAISSStore:
         self.meta: List[Dict[str, Any]] = []
         self._vectorizer = SimpleVectorizer(dim=dim)
 
-        base_dir = Path(os.getenv("DATA_DIR", "./scraped_pages")) / tenant_id
-        base_dir.mkdir(parents=True, exist_ok=True)
-        self.data_dir = base_dir
-        self.index_path = base_dir / "faiss.index"
-        self.meta_path = base_dir / "faiss.meta.json"
+        # JSON data lives per-tenant under DATA_DIR/<tenant_id>
+        data_root = Path(os.getenv("DATA_DIR", "./scraped_pages"))
+        self.data_dir = data_root / tenant_id
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+
+        # Store FAISS artifacts under DATA_DIR/faiss_data/<tenant_id>
+        faiss_dir = data_root / "faiss_data" / tenant_id
+        faiss_dir.mkdir(parents=True, exist_ok=True)
+        self.index_path = faiss_dir / "faiss.index"
+        self.meta_path = faiss_dir / "faiss.meta.json"
 
     def _load_index(self) -> bool:
         try:
@@ -99,12 +104,21 @@ class FAISSStore:
             try:
                 with open(fp, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                content = data.get("content") or data.get("markdown") or ""
+                # Prefer markdown (has paragraph breaks); fallback to content
+                content = (data.get("markdown") or data.get("content") or "").strip()
                 url = data.get("url") or str(fp)
                 title = data.get("title") or ""
                 if not content:
                     continue
                 paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
+                if not paragraphs:
+                    # Fallback split by single newlines or sentences if no double-newline blocks
+                    tmp = [p.strip() for p in content.split("\n") if p.strip()]
+                    if len(tmp) > 1:
+                        paragraphs = tmp
+                    else:
+                        # Rough sentence split
+                        paragraphs = [s.strip() for s in content.replace("? ", "?\n").replace(". ", ".\n").split("\n") if s.strip()]
                 current = ""
                 for p in paragraphs or [content]:
                     if len(current) + len(p) + 2 <= max_chars:

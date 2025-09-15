@@ -30,6 +30,7 @@ import shutil
 from datetime import datetime
 from db import create_crawl_job, set_crawl_status
 import uuid
+from vector_store import FAISSStore
 
 # Load environment variables
 load_dotenv()
@@ -137,41 +138,15 @@ class MCPServer:
                     },
                     "required": ["query"]
                 }
-            },
-            {
-                "name": "scrape_website",
-                "description": "Crawl and scrape a site for a tenant; builds the tenant knowledge base",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "tenant_id": {"type": "string", "description": "Tenant identifier"},
-                        "url": {"type": "string", "description": "Base URL to crawl"},
-                        "excluded_urls": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Optional list of URL prefixes to exclude"
-                        }
-                    },
-                    "required": ["tenant_id", "url"]
-                }
-            },
-            {
-                "name": "search_knowledge_base",
-                "description": "Search tenant knowledge base and return top snippets + citations",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "tenant_id": {"type": "string", "description": "Tenant identifier"},
-                        "query": {"type": "string", "description": "User query to retrieve relevant snippets"},
-                        "k": {"type": "integer", "description": "Top-K to retrieve", "default": 5}
-                    },
-                    "required": ["tenant_id", "query"]
-                }
             }
         ]
     
     async def handle_initialize(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Handle MCP initialization"""
+        try:
+            logger.info(f"MCP initialize received: params_keys={list((params or {}).keys())}")
+        except Exception:
+            pass
         return {
             "protocolVersion": "2024-11-05",
             "capabilities": {
@@ -185,6 +160,7 @@ class MCPServer:
     
     async def handle_tools_list(self) -> Dict[str, Any]:
         """Handle tools/list request"""
+        logger.info("MCP tools/list requested")
         return {
             "tools": self.tools
         }
@@ -192,12 +168,12 @@ class MCPServer:
     async def handle_tools_call(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Handle tools/call request"""
         try:
+            try:
+                logger.info(f"MCP tools/call: name={name} args_keys={list((arguments or {}).keys())}")
+            except Exception:
+                pass
             if name == "lookup_kb":
                 return await self._lookup_kb(arguments)
-            if name == "scrape_website":
-                return await self._tool_scrape_website(arguments)
-            if name == "search_knowledge_base":
-                return await self._tool_search_kb(arguments)
             else:
                 raise ValueError(f"Unknown tool: {name}")
         except Exception as e:
@@ -597,22 +573,53 @@ class MCPServer:
         if not query:
             raise ValueError("query is required")
         k = int(arguments.get("k", 5))
-        from kb import lookup_kb_minimal
         # Optional tenant scoping
-        tenant_id = (arguments.get("tenant_id") or "").strip()
-        data_dir = None
-        if tenant_id:
-            base_dir = os.getenv("DATA_DIR", "./scraped_pages")
-            data_dir = os.path.join(base_dir, tenant_id)
+        tenant_id = (arguments.get("tenant_id") or "").strip() or "default"
+        logger.info(f"MCP lookup_kb: tenant={tenant_id} q_len={len(query)} k={k}")
+        # Try FAISS-backed retrieval first; build if missing. Fallback to minimal KB.
+        try:
+            store = FAISSStore(tenant_id=tenant_id)
+            warm = store.search("warmup", k=1)
+            logger.info(f"FAISS warmup search returned {len(warm)} hits")
+            if warm == []:
+                # If index not present, attempt a quick build (best-effort)
+                logger.info("FAISS index not warm; attempting build()")
+                built = store.build()
+                logger.info(f"FAISS build completed; chunks_indexed={built}")
+            faiss_hits = store.search(query, k=k)
+            logger.info(f"FAISS search hits={len(faiss_hits)}")
+        except Exception:
+            logger.warning("FAISS path failed, falling back to lexical")
+            faiss_hits = []
+
+        if faiss_hits:
+            snippets = [hit.get("snippet", "") for hit in faiss_hits if hit.get("snippet")]
+            citations = [{"url": hit.get("url"), "title": hit.get("title", "")} for hit in faiss_hits]
+            answer = ""  # Let client synthesize with LLM using snippets
+            logger.info(f"Returning FAISS result: snippets={len(snippets)} citations={len(citations)}")
+            return {
+                "content": [{"type": "text", "text": f"Retrieved {len(snippets)} snippets via FAISS"}],
+                "isError": False,
+                "toolCallId": "lookup_kb_result",
+                "metadata": {"snippets": snippets, "citations": citations, "k": k, "faiss": True}
+            }
+
+        # Fallback to lexical minimal lookup
+        from kb import lookup_kb_minimal
+        base_dir = os.getenv("DATA_DIR", "./scraped_pages")
+        data_dir = os.path.join(base_dir, tenant_id)
         result = lookup_kb_minimal(query, k=k, data_dir=data_dir)
-        text = result.get("answer", "")
+        try:
+            logger.info(
+                f"Returning lexical result: snippets={len(result.get('snippets', []) or [])} citations={len(result.get('citations', []) or [])}"
+            )
+        except Exception:
+            pass
         return {
-            "content": [
-                {"type": "text", "text": text[:4000]}
-            ],
+            "content": [{"type": "text", "text": f"Retrieved {len(result.get('snippets', []))} snippets via lexical"}],
             "isError": False,
             "toolCallId": "lookup_kb_result",
-            "metadata": result
+            "metadata": result | {"faiss": False}
         }
 
 # Global exception handler for HTTP API
@@ -767,6 +774,12 @@ async def crawl_website(request: CrawlRequest):
                 _crawl_jobs[tenant_id_local]["status"] = "done"
                 _crawl_jobs[tenant_id_local]["message"] = f"Crawled and scraped {base_url}"
                 _crawl_jobs[tenant_id_local]["updated_at"] = asyncio.get_running_loop().time()
+                # Build/refresh FAISS index for this tenant (best-effort)
+                try:
+                    from vector_store import FAISSStore
+                    FAISSStore(tenant_id=tenant_id_local).build()
+                except Exception:
+                    pass
                 try:
                     set_crawl_status(int(job_id_local or 0), "done", f"Crawled and scraped {base_url}", finished=True)
                 except Exception:
@@ -1071,11 +1084,21 @@ class MCPTransport:
                 if not line:
                     break
                 
-                request = json.loads(line.strip())
+                raw = line.strip()
+                try:
+                    logger.info(f"MCP STDIO RX: {raw[:200]}{'...' if len(raw)>200 else ''}")
+                except Exception:
+                    pass
+                request = json.loads(raw)
                 response = await self._handle_request(request)
                 
                 # Send response to stdout
-                print(json.dumps(response), flush=True)
+                out = json.dumps(response)
+                try:
+                    logger.info(f"MCP STDIO TX: {out[:200]}{'...' if len(out)>200 else ''}")
+                except Exception:
+                    pass
+                print(out, flush=True)
                 
             except json.JSONDecodeError as e:
                 logger.error(f"Invalid JSON: {e}")
