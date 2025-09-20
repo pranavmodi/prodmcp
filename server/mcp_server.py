@@ -10,6 +10,8 @@ import logging
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 import sys
+import ssl
+import websockets
 
 # Import our existing functionality
 from storage import HTMLStorage
@@ -735,12 +737,164 @@ class MCPTransport:
             }
         }
 
+class MCPWebSocketTransport:
+    """Handles MCP protocol communication over WebSocket"""
+
+    def __init__(self, server: MCPServer):
+        self.server = server
+        self.clients = set()
+
+    async def handle_client(self, websocket, path):
+        """Handle a new WebSocket client connection"""
+        client_id = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
+        logger.info(f"MCP WebSocket client connected: {client_id} (path: {path})")
+        self.clients.add(websocket)
+
+        try:
+            async for message in websocket:
+                try:
+                    # Parse incoming JSON-RPC request
+                    raw_data = message
+                    logger.info(f"MCP WS RX [{client_id}]: {raw_data[:200]}{'...' if len(raw_data)>200 else ''}")
+
+                    request = json.loads(raw_data)
+                    response = await self._handle_request(request)
+
+                    # Send JSON-RPC response
+                    response_data = json.dumps(response)
+                    logger.info(f"MCP WS TX [{client_id}]: {response_data[:200]}{'...' if len(response_data)>200 else ''}")
+
+                    await websocket.send(response_data)
+
+                except json.JSONDecodeError as e:
+                    logger.error(f"Invalid JSON from client {client_id}: {e}")
+                    error_response = self._create_error_response(None, -32700, "Parse error")
+                    await websocket.send(json.dumps(error_response))
+                except Exception as e:
+                    logger.error(f"Error handling message from client {client_id}: {e}")
+                    error_response = self._create_error_response(None, -32603, "Internal error")
+                    await websocket.send(json.dumps(error_response))
+
+        except websockets.exceptions.ConnectionClosed:
+            logger.info(f"MCP WebSocket client disconnected: {client_id}")
+        except Exception as e:
+            logger.error(f"WebSocket error for client {client_id}: {e}")
+        finally:
+            self.clients.discard(websocket)
+
+    async def _handle_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle incoming MCP request"""
+        method = request.get("method")
+        request_id = request.get("id")
+        params = request.get("params", {})
+
+        try:
+            if method == "initialize":
+                result = await self.server.handle_initialize(params)
+            elif method == "tools/list":
+                result = await self.server.handle_tools_list()
+            elif method == "tools/call":
+                name = params.get("name")
+                arguments = params.get("arguments", {})
+                result = await self.server.handle_tools_call(name, arguments)
+            else:
+                return self._create_error_response(request_id, -32601, "Method not found")
+
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": result
+            }
+
+        except Exception as e:
+            logger.error(f"Error handling request {method}: {e}")
+            return self._create_error_response(request_id, -32603, str(e))
+
+    def _create_error_response(self, request_id: Any, code: int, message: str) -> Dict[str, Any]:
+        """Create error response"""
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": code,
+                "message": message
+            }
+        }
+
 async def main():
     """Main entry point - starts MCP server"""
-    logger.info("📡 Starting MCP Server (stdio only)")
-    server = MCPServer()
-    transport = MCPTransport(server)
-    await transport.run()
+    import sys
+
+    # Check command line arguments for mode
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--websocket" or sys.argv[1] == "--ws":
+            # WebSocket mode
+            port = int(sys.argv[2]) if len(sys.argv) > 2 else 8765
+            logger.info(f"🌐 Starting MCP Server (WebSocket mode on port {port})")
+
+            server = MCPServer()
+            ws_transport = MCPWebSocketTransport(server)
+
+            # Create a wrapper function to handle the websocket connection
+            async def websocket_handler(*args):
+                websocket = args[0]
+                path = args[1] if len(args) > 1 else "/"
+                await ws_transport.handle_client(websocket, path)
+
+            # Start WebSocket server
+            start_server = websockets.serve(
+                websocket_handler,
+                "0.0.0.0",
+                port,
+                ping_interval=20,
+                ping_timeout=10
+            )
+
+            logger.info(f"🚀 MCP WebSocket server listening on ws://0.0.0.0:{port}")
+            logger.info("📡 Waiting for client connections...")
+
+            await start_server
+            await asyncio.Future()  # Run forever
+
+        elif sys.argv[1] == "--mcp-only":
+            # Legacy stdio mode (for backwards compatibility)
+            logger.info("📡 Starting MCP Server (stdio mode)")
+            server = MCPServer()
+            transport = MCPTransport(server)
+            await transport.run()
+        else:
+            print("Usage:")
+            print("  python mcp_server.py --websocket [port]  # WebSocket mode (default port: 8765)")
+            print("  python mcp_server.py --mcp-only         # stdio mode")
+            print("  python mcp_server.py                    # Default: WebSocket mode")
+    else:
+        # Default to WebSocket mode
+        port = int(os.getenv("MCP_WEBSOCKET_PORT", "8765"))
+        logger.info(f"🌐 Starting MCP Server (WebSocket mode on port {port})")
+
+        server = MCPServer()
+        ws_transport = MCPWebSocketTransport(server)
+
+        # Create a wrapper function to handle the websocket connection
+        async def websocket_handler(*args):
+            websocket = args[0]
+            path = args[1] if len(args) > 1 else "/"
+            await ws_transport.handle_client(websocket, path)
+
+        # Start WebSocket server
+        start_server = websockets.serve(
+            websocket_handler,
+            "0.0.0.0",
+            port,
+            ping_interval=20,
+            ping_timeout=10
+        )
+
+        logger.info(f"🚀 MCP WebSocket server listening on ws://0.0.0.0:{port}")
+        logger.info("📡 Waiting for client connections...")
+
+        await start_server
+        await asyncio.Future()  # Run forever
 
 if __name__ == "__main__":
     asyncio.run(main()) 
