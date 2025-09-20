@@ -2,16 +2,21 @@
 """
 MCP Server for Web Scraping and QA
 Implements Model Context Protocol for AI tool integration
+Supports hybrid mode: HTTP API + WebSocket + stdio MCP protocol
 """
 
 import asyncio
 import json
 import logging
+import uuid
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 import sys
 import ssl
 import websockets
+import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 # Import our existing functionality
 from storage import HTMLStorage
@@ -22,12 +27,34 @@ from dotenv import load_dotenv
 
 from vector_store import FAISSStore
 
+# Import route modules
+from routes.crawl import router as crawl_router
+
 # Load environment variables
 load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# FastAPI app for HTTP endpoints
+app = FastAPI(
+    title="MCP Server API",
+    description="HTTP API for Model Context Protocol Server",
+    version="2.0.0"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure appropriately for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include route modules
+app.include_router(crawl_router)
 
 class MCPServer:
     """Traditional MCP Server implementing the MCP protocol"""
@@ -821,80 +848,76 @@ class MCPWebSocketTransport:
             }
         }
 
+async def run_websocket_server(port: int):
+    """Run WebSocket MCP server"""
+    server = MCPServer()
+    ws_transport = MCPWebSocketTransport(server)
+
+    # Create a wrapper function to handle the websocket connection
+    async def websocket_handler(*args):
+        websocket = args[0]
+        path = args[1] if len(args) > 1 else "/"
+        await ws_transport.handle_client(websocket, path)
+
+    # Start WebSocket server
+    logger.info(f"🚀 MCP WebSocket server listening on ws://0.0.0.0:{port}")
+
+    async with websockets.serve(
+        websocket_handler,
+        "0.0.0.0",
+        port,
+        ping_interval=20,
+        ping_timeout=10
+    ) as server:
+        logger.info("📡 WebSocket server ready, waiting for connections...")
+        await server.wait_closed()
+
+async def start_http_server(port: int):
+    """Start HTTP API server"""
+    config = uvicorn.Config(
+        app=app,
+        host="0.0.0.0",
+        port=port,
+        log_level="info"
+    )
+    server = uvicorn.Server(config)
+    logger.info(f"🌐 HTTP API server listening on http://0.0.0.0:{port}")
+    await server.serve()
+
 async def main():
-    """Main entry point - starts MCP server"""
-    import sys
+    """Main entry point - starts hybrid MCP + HTTP server"""
+    # Always start in hybrid mode
+    ws_port = int(os.getenv("MCP_WEBSOCKET_PORT", "8765"))
+    http_port = int(os.getenv("MCP_HTTP_PORT", "8000"))
 
-    # Check command line arguments for mode
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "--websocket" or sys.argv[1] == "--ws":
-            # WebSocket mode
-            port = int(sys.argv[2]) if len(sys.argv) > 2 else 8765
-            logger.info(f"🌐 Starting MCP Server (WebSocket mode on port {port})")
+    logger.info("🚀 Starting Hybrid MCP + HTTP Server")
+    logger.info(f"📡 MCP WebSocket: ws://0.0.0.0:{ws_port}")
+    logger.info(f"🌐 HTTP API: http://0.0.0.0:{http_port}")
 
-            server = MCPServer()
-            ws_transport = MCPWebSocketTransport(server)
+    # Create tasks for both servers with error handling
+    async def run_ws_with_error_handling():
+        try:
+            await run_websocket_server(ws_port)
+        except Exception as e:
+            logger.error(f"WebSocket server failed: {e}")
+            raise
 
-            # Create a wrapper function to handle the websocket connection
-            async def websocket_handler(*args):
-                websocket = args[0]
-                path = args[1] if len(args) > 1 else "/"
-                await ws_transport.handle_client(websocket, path)
+    async def run_http_with_error_handling():
+        try:
+            await start_http_server(http_port)
+        except Exception as e:
+            logger.error(f"HTTP server failed: {e}")
+            raise
 
-            # Start WebSocket server
-            start_server = websockets.serve(
-                websocket_handler,
-                "0.0.0.0",
-                port,
-                ping_interval=20,
-                ping_timeout=10
-            )
+    ws_task = asyncio.create_task(run_ws_with_error_handling())
+    http_task = asyncio.create_task(run_http_with_error_handling())
 
-            logger.info(f"🚀 MCP WebSocket server listening on ws://0.0.0.0:{port}")
-            logger.info("📡 Waiting for client connections...")
-
-            await start_server
-            await asyncio.Future()  # Run forever
-
-        elif sys.argv[1] == "--mcp-only":
-            # Legacy stdio mode (for backwards compatibility)
-            logger.info("📡 Starting MCP Server (stdio mode)")
-            server = MCPServer()
-            transport = MCPTransport(server)
-            await transport.run()
-        else:
-            print("Usage:")
-            print("  python mcp_server.py --websocket [port]  # WebSocket mode (default port: 8765)")
-            print("  python mcp_server.py --mcp-only         # stdio mode")
-            print("  python mcp_server.py                    # Default: WebSocket mode")
-    else:
-        # Default to WebSocket mode
-        port = int(os.getenv("MCP_WEBSOCKET_PORT", "8765"))
-        logger.info(f"🌐 Starting MCP Server (WebSocket mode on port {port})")
-
-        server = MCPServer()
-        ws_transport = MCPWebSocketTransport(server)
-
-        # Create a wrapper function to handle the websocket connection
-        async def websocket_handler(*args):
-            websocket = args[0]
-            path = args[1] if len(args) > 1 else "/"
-            await ws_transport.handle_client(websocket, path)
-
-        # Start WebSocket server
-        start_server = websockets.serve(
-            websocket_handler,
-            "0.0.0.0",
-            port,
-            ping_interval=20,
-            ping_timeout=10
-        )
-
-        logger.info(f"🚀 MCP WebSocket server listening on ws://0.0.0.0:{port}")
-        logger.info("📡 Waiting for client connections...")
-
-        await start_server
-        await asyncio.Future()  # Run forever
+    # Run both servers concurrently
+    try:
+        await asyncio.gather(ws_task, http_task)
+    except Exception as e:
+        logger.error(f"Server startup failed: {e}")
+        raise
 
 if __name__ == "__main__":
     asyncio.run(main()) 
