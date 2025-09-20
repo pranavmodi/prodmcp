@@ -4,14 +4,20 @@ from typing import Optional
 
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, func
 from sqlalchemy.orm import declarative_base, sessionmaker
+from dotenv import load_dotenv
 
 
-# Default to local Postgres per user request
-# user=neha password=postgres db=postgres host=localhost port=5432
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+psycopg2://neha:postgres@localhost:5432/postgres",
-)
+"""Database configuration and ORM models."""
+
+# Ensure environment variables from server/.env are loaded if present
+load_dotenv()
+
+# Require DATABASE_URL to be set explicitly; fail fast if missing
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is not set. Set it in server/.env or export it before starting the server."
+    )
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)

@@ -1,7 +1,7 @@
 import os
 import json
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import numpy as np
 
@@ -47,6 +47,39 @@ class SimpleVectorizer:
         return v.astype(np.float32)
 
 
+class OpenAIEmbedder:
+    """Optional OpenAI embedding backend for higher-quality vectors."""
+    def __init__(self, model: str = "text-embedding-3-small"):
+        self.model = model
+        self._client = None
+        try:
+            # Lazy import to avoid hard dependency
+            from openai import OpenAI  # type: ignore
+            self._client = OpenAI()
+        except Exception:
+            self._client = None
+
+    def is_available(self) -> bool:
+        return self._client is not None and bool(os.getenv("OPENAI_API_KEY"))
+
+    def embed_texts(self, texts: List[str]) -> Optional[np.ndarray]:
+        try:
+            if not self.is_available():
+                return None
+            if not texts:
+                return np.zeros((0, 1536), dtype=np.float32)
+            # The SDK accepts a list input; returns data[].embedding
+            resp = self._client.embeddings.create(model=self.model, input=texts)
+            vecs = [np.array(d.embedding, dtype=np.float32) for d in resp.data]
+            arr = np.vstack(vecs)
+            # Normalize for cosine/inner-product
+            import faiss  # type: ignore
+            faiss.normalize_L2(arr)
+            return arr
+        except Exception:
+            return None
+
+
 class FAISSStore:
     def __init__(self, tenant_id: str, dim: int = 768):
         self.tenant_id = tenant_id
@@ -54,6 +87,7 @@ class FAISSStore:
         self.index = None
         self.meta: List[Dict[str, Any]] = []
         self._vectorizer = SimpleVectorizer(dim=dim)
+        self._embedder = OpenAIEmbedder(model=os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small"))
 
         # JSON data lives per-tenant under DATA_DIR/<tenant_id>
         data_root = Path(os.getenv("DATA_DIR", "./scraped_pages"))
@@ -146,7 +180,12 @@ class FAISSStore:
         if not chunks:
             return 0
 
-        embeddings = np.vstack([self._vectorizer.embed_text(t) for t in chunks])
+        # Try OpenAI embeddings first (if available), else fallback to hashing vectorizer
+        embeddings = None
+        if self._embedder.is_available():
+            embeddings = self._embedder.embed_texts(chunks)
+        if embeddings is None:
+            embeddings = np.vstack([self._vectorizer.embed_text(t) for t in chunks])
         try:
             import faiss  # type: ignore
             faiss.normalize_L2(embeddings)
@@ -166,7 +205,15 @@ class FAISSStore:
             import faiss  # type: ignore
         except Exception:
             return []
-        q = self._vectorizer.embed_text(query).reshape(1, -1)
+        # Use OpenAI embeddings if available for query; fallback to hashing
+        if self._embedder.is_available():
+            emb = self._embedder.embed_texts([query])
+            if emb is None or emb.shape[0] == 0:
+                q = self._vectorizer.embed_text(query).reshape(1, -1)
+            else:
+                q = emb.reshape(1, -1)
+        else:
+            q = self._vectorizer.embed_text(query).reshape(1, -1)
         try:
             import faiss  # type: ignore
             faiss.normalize_L2(q)
@@ -184,3 +231,11 @@ class FAISSStore:
                 "snippet": self.meta[idx].get("snippet", ""),
             })
         return results
+
+    def embed_text(self, text: str) -> np.ndarray:
+        """Expose a single-text embedding using best available backend."""
+        if self._embedder.is_available():
+            arr = self._embedder.embed_texts([text])
+            if arr is not None and arr.shape[0] > 0:
+                return arr[0]
+        return self._vectorizer.embed_text(text)
