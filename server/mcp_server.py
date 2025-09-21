@@ -711,6 +711,131 @@ Query to analyze: {query}""",
             logger.error(f"OpenAI Responses API call failed: {e}", exc_info=True)
             raise
 
+    async def _keyword_search(self, tenant_id: str, keywords: List[str], phrases: List[str], k: int = 5, allowed_domains: set = None) -> List[Dict[str, Any]]:
+        """Perform keyword/phrase search on tenant JSON files"""
+        base_dir = os.getenv("DATA_DIR", "./scraped_pages")
+        data_dir = os.path.join(base_dir, tenant_id)
+
+        if not os.path.exists(data_dir):
+            return []
+
+        # Collect all search terms
+        search_terms = []
+        if keywords:
+            search_terms.extend([term.lower() for term in keywords])
+        if phrases:
+            search_terms.extend([phrase.lower() for phrase in phrases])
+
+        if not search_terms:
+            return []
+
+        # Find all JSON files
+        json_files = []
+        for root, dirs, files in os.walk(data_dir):
+            for file in files:
+                if file.endswith('.json'):
+                    json_files.append(os.path.join(root, file))
+
+        results = []
+
+        for json_file in json_files:
+            try:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+
+                # Extract text content for searching
+                content = data.get('content', '') or data.get('markdown', '') or ''
+                title = data.get('title', '')
+                url = data.get('url', '')
+
+                if not content:
+                    continue
+
+                # Domain filtering
+                if allowed_domains and url:
+                    try:
+                        from urllib.parse import urlparse
+                        host = urlparse(url).netloc.lower()
+                        if host not in allowed_domains:
+                            continue
+                    except Exception:
+                        continue
+
+                # Search for keywords and phrases in content (case-insensitive)
+                content_lower = content.lower()
+                title_lower = title.lower()
+
+                # Calculate relevance score
+                score = 0.0
+                matched_terms = []
+
+                for term in search_terms:
+                    if not term:
+                        continue
+
+                    # Count occurrences in content
+                    content_matches = content_lower.count(term)
+                    title_matches = title_lower.count(term)
+
+                    if content_matches > 0 or title_matches > 0:
+                        matched_terms.append(term)
+                        # Weight title matches higher
+                        score += title_matches * 2.0 + content_matches * 1.0
+
+                # Only include if we found matching terms
+                if score > 0:
+                    # Create snippet around the first match
+                    snippet = self._create_keyword_snippet(content, matched_terms)
+
+                    results.append({
+                        'url': url,
+                        'title': title,
+                        'snippet': snippet,
+                        'score': score,
+                        'matched_terms': matched_terms
+                    })
+
+            except Exception as e:
+                continue
+
+        # Sort by relevance score (descending)
+        results.sort(key=lambda x: x['score'], reverse=True)
+
+        # Return top k results
+        return results[:k]
+
+    def _create_keyword_snippet(self, content: str, matched_terms: List[str], max_length: int = 1200) -> str:
+        """Create a snippet around keyword matches"""
+        if not content or not matched_terms:
+            return content[:max_length] if content else ""
+
+        content_lower = content.lower()
+
+        # Find the first occurrence of any matched term
+        best_start = -1
+        for term in matched_terms:
+            if term:
+                pos = content_lower.find(term.lower())
+                if pos != -1 and (best_start == -1 or pos < best_start):
+                    best_start = pos
+
+        if best_start == -1:
+            return content[:max_length]
+
+        # Create snippet around the match
+        snippet_start = max(0, best_start - 100)
+        snippet_end = min(len(content), best_start + max_length - 100)
+
+        snippet = content[snippet_start:snippet_end]
+
+        # Add ellipsis if truncated
+        if snippet_start > 0:
+            snippet = "..." + snippet
+        if snippet_end < len(content):
+            snippet = snippet + "..."
+
+        return snippet
+
     async def _lookup_kb(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Lookup knowledge base from local scraped JSON using a minimal RAG approach."""
         query = arguments.get("query")
@@ -739,16 +864,20 @@ Query to analyze: {query}""",
 
         # Try FAISS-backed retrieval first; build if missing. Fallback to minimal KB.
         try:
+            logger.info(f"🔍 attempting vector search for tenant: {tenant_id}")
             store = FAISSStore(tenant_id=tenant_id)
             warm = store.search("warmup", k=1)
+            logger.info(f"🔍 warmup search returned {len(warm)} results")
             if warm == []:
                 # If index not present, attempt a quick build (best-effort)
+                logger.info("🔍 FAISS index not warm; attempting build()")
                 built = store.build()
+                logger.info(f"🔍 FAISS build completed; chunks_indexed={built}")
 
             # Collect all search terms for vector search
             variants = [query] + (expansion.query_variants if expansion else [])
 
-            # Collect all keywords for text search (to be implemented)
+            # Collect all keywords for text search
             all_keywords = (expansion.keywords + expansion.domain_terms) if expansion else []
             all_phrases = (expansion.phrases) if expansion else []
 
@@ -778,9 +907,11 @@ Query to analyze: {query}""",
             unique_hits: dict = {}
             variant_results = {}
 
+            logger.info(f"🔍 searching {len(variants[:12])} variants")
             for v in variants[:12]:
                 hits = store.search(v, k=per_k)
                 variant_results[v] = len(hits)
+                logger.info(f"🔍 variant '{v}' returned {len(hits)} hits")
 
                 for h in hits:
                     # Domain filter
@@ -822,25 +953,82 @@ Query to analyze: {query}""",
                     selected.append(cand)
 
             faiss_hits = selected
-        except Exception:
+            if faiss_hits:
+                logger.info(f"🔍 vector search found {len(faiss_hits)} results")
+        except Exception as e:
+            logger.info(f"🔍 vector search failed: {e}")
             faiss_hits = []
 
-        if faiss_hits:
-            snippets = [hit.get("snippet", "") for hit in faiss_hits if hit.get("snippet")]
-            citations = [{"url": hit.get("url"), "title": hit.get("title", "")} for hit in faiss_hits]
+        # Perform keyword search to complement vector search
+        keyword_hits = []
+        if all_keywords or all_phrases:
+            try:
+                keyword_hits = await self._keyword_search(tenant_id, all_keywords, all_phrases, k=k, allowed_domains=allowed_domains)
+                if keyword_hits:
+                    logger.info(f"🔑 keyword search found {len(keyword_hits)} results")
+            except Exception:
+                keyword_hits = []
 
-            # Log snippets succinctly
+        # Merge FAISS and keyword results
+        combined_hits = []
+
+        if faiss_hits and keyword_hits:
+            # Combine both results, prioritizing vector search but including unique keyword results
+            seen_snippets = set()
+
+            # Add FAISS results first
+            for hit in faiss_hits:
+                snippet = hit.get("snippet", "")
+                if snippet and snippet not in seen_snippets:
+                    combined_hits.append({**hit, "source": "vector"})
+                    seen_snippets.add(snippet)
+
+            # Add unique keyword results
+            for hit in keyword_hits:
+                snippet = hit.get("snippet", "")
+                if snippet and snippet not in seen_snippets:
+                    combined_hits.append({**hit, "source": "keyword"})
+                    seen_snippets.add(snippet)
+
+            # Limit to k results
+            combined_hits = combined_hits[:k]
+            logger.info(f"🔄 hybrid merge: {len([h for h in combined_hits if h.get('source') == 'vector'])} vector + {len([h for h in combined_hits if h.get('source') == 'keyword'])} keyword = {len(combined_hits)} total")
+
+        elif faiss_hits:
+            combined_hits = [{**hit, "source": "vector"} for hit in faiss_hits]
+            logger.info(f"🔍 using only vector search: {len(combined_hits)} results")
+        elif keyword_hits:
+            combined_hits = [{**hit, "source": "keyword"} for hit in keyword_hits]
+            logger.info(f"🔑 using only keyword search: {len(combined_hits)} results")
+
+        if combined_hits:
+            snippets = [hit.get("snippet", "") for hit in combined_hits if hit.get("snippet")]
+            citations = [{"url": hit.get("url"), "title": hit.get("title", "")} for hit in combined_hits]
+
+            # Log snippets with source information
             logger.info(f"📄 snippets ({len(snippets)}):")
-            for i, snippet in enumerate(snippets[:k], 1):
+            for i, (snippet, hit) in enumerate(zip(snippets[:k], combined_hits[:k]), 1):
                 snippet_preview = snippet[:140] + "..." if len(snippet) > 140 else snippet
-                logger.info(f"  {i}. {snippet_preview}")
+                source = hit.get("source", "unknown")
+                source_icon = "🔍" if source == "vector" else "🔑" if source == "keyword" else "❓"
+                logger.info(f"  {i}. {source_icon} {snippet_preview}")
+
+            # Count sources for reporting
+            vector_count = sum(1 for hit in combined_hits if hit.get("source") == "vector")
+            keyword_count = sum(1 for hit in combined_hits if hit.get("source") == "keyword")
 
             # Build metadata with query expansion info (guard if expansion not available)
             metadata = {
                 "snippets": snippets,
                 "citations": citations,
                 "k": k,
-                "faiss": True,
+                "faiss": len(faiss_hits) > 0,
+                "keyword_search": len(keyword_hits) > 0,
+                "hybrid_results": {
+                    "vector_results": vector_count,
+                    "keyword_results": keyword_count,
+                    "total_results": len(combined_hits)
+                },
                 "query_expansion": {
                     "original_query": query,
                     "variants_used": (expansion.query_variants if expansion else []),
@@ -850,8 +1038,16 @@ Query to analyze: {query}""",
                 }
             }
 
+            # Create descriptive message about search results
+            if vector_count > 0 and keyword_count > 0:
+                search_description = f"hybrid search ({vector_count} vector + {keyword_count} keyword)"
+            elif vector_count > 0:
+                search_description = "vector search"
+            else:
+                search_description = "keyword search"
+
             return {
-                "content": [{"type": "text", "text": f"Retrieved {len(snippets)} snippets via FAISS"}],
+                "content": [{"type": "text", "text": f"Retrieved {len(snippets)} snippets via {search_description}"}],
                 "isError": False,
                 "toolCallId": "lookup_kb_result",
                 "metadata": metadata

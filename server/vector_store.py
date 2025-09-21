@@ -86,13 +86,18 @@ class OpenAIEmbedder:
 
 
 class FAISSStore:
-    def __init__(self, tenant_id: str, dim: int = 768):
+    def __init__(self, tenant_id: str, dim: int = None):
         self.tenant_id = tenant_id
-        self.dim = dim
+        # Auto-detect dimension based on embedder availability
+        self._embedder = OpenAIEmbedder(model=os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small"))
+        if dim is None:
+            # Use OpenAI embedding dimension if available, else default to 768
+            self.dim = 1536 if self._embedder.is_available() else 768
+        else:
+            self.dim = dim
         self.index = None
         self.meta: List[Dict[str, Any]] = []
-        self._vectorizer = SimpleVectorizer(dim=dim)
-        self._embedder = OpenAIEmbedder(model=os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small"))
+        self._vectorizer = SimpleVectorizer(dim=self.dim)
 
         # JSON data lives per-tenant under DATA_DIR/<tenant_id>
         data_root = Path(os.getenv("DATA_DIR", "./scraped_pages"))
@@ -139,7 +144,9 @@ class FAISSStore:
 
         chunks: List[str] = []
         meta: List[Dict[str, Any]] = []
-        for fp in _list_json_files(str(self.data_dir)):
+        json_files = _list_json_files(str(self.data_dir))
+
+        for fp in json_files:
             try:
                 with open(fp, "r", encoding="utf-8") as f:
                     data = json.load(f)
