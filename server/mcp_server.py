@@ -18,6 +18,7 @@ import websockets
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # Import our existing functionality
 from storage import HTMLStorage
@@ -40,6 +41,18 @@ logger = logging.getLogger(__name__)
 
 # Global shutdown event
 shutdown_event = asyncio.Event()
+
+# Pydantic model for structured query expansion
+class QueryExpansion(BaseModel):
+    """Schema for OpenAI structured output - query expansion and keyword extraction"""
+    original_query: str
+    query_variants: List[str]  # Semantic paraphrases for vector search
+    keywords: List[str]        # Important individual terms for keyword search
+    phrases: List[str]         # Key multi-word phrases
+    domain_terms: List[str]    # Domain-specific related terms
+
+    class Config:
+        extra = "forbid"  # This ensures additionalProperties: false in the JSON schema
 
 # FastAPI app for HTTP endpoints
 app = FastAPI(
@@ -568,6 +581,82 @@ class MCPServer:
             "metadata": {"snippets": snippets, "citations": citations, "k": k}
         }
 
+    async def _expand_query_with_ai(self, query: str) -> QueryExpansion:
+        """Use OpenAI Responses API with structured outputs to expand query into variants and keywords"""
+        if not os.getenv("OPENAI_API_KEY"):
+            raise ValueError("OPENAI_API_KEY is required for query expansion")
+
+        import httpx
+
+        # Prepare the request for the Responses API
+        url = "https://api.openai.com/v1/responses"
+        headers = {
+            "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "model": os.getenv("LLM_MULTIQUERY_MODEL", "gpt-4o-mini"),
+            "input": f"""You are a search query analyzer for a business knowledge base system.
+
+Analyze this search query and extract:
+1. query_variants: 3-5 semantic paraphrases that maintain the same meaning
+2. keywords: Important individual words for exact text matching
+3. phrases: Key multi-word phrases (2-4 words) that should be searched together
+4. domain_terms: Related business/contact terms that might appear in relevant content
+
+Focus on business information, contact details, services, and company information queries.
+Keep variants concise (max 8 words each).
+Avoid overly generic terms in keywords.
+
+Query to analyze: {query}""",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "QueryExpansion",
+                    "schema": QueryExpansion.model_json_schema(),
+                    "strict": True
+                }
+            },
+            "temperature": 0.3
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(url, headers=headers, json=payload)
+
+            # Debug: Log the error response if request fails
+            if response.status_code != 200:
+                logger.error(f"OpenAI Responses API error {response.status_code}: {response.text}")
+
+            response.raise_for_status()
+            result = response.json()
+
+            # Debug: Log the response structure
+            logger.info(f"Responses API response structure: {list(result.keys())}")
+
+            # Extract the structured content from the response (Responses API format)
+            if "text" in result:
+                # Handle potential error
+                if "error" in result and result["error"]:
+                    raise ValueError(f"OpenAI Responses API error: {result['error']}")
+
+                content = result.get("text")
+                if not content:
+                    raise ValueError("Empty text response from OpenAI Responses API")
+
+                # Check if content is already parsed or if it's a string
+                if isinstance(content, dict):
+                    # Content is already structured data
+                    data = content
+                else:
+                    # Content is a JSON string that needs parsing
+                    import json as _json
+                    data = _json.loads(content)
+
+                return QueryExpansion(**data)
+            else:
+                raise ValueError("Invalid response structure from OpenAI Responses API")
+
     async def _lookup_kb(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Lookup knowledge base from local scraped JSON using a minimal RAG approach."""
         query = arguments.get("query")
@@ -588,46 +677,21 @@ class MCPServer:
                 # If index not present, attempt a quick build (best-effort)
                 built = store.build()
 
-            # Multi-query expansion: heuristics + optional LLM-generated variants
-            variants = [query]
-            ql = query.lower()
+            # AI-powered query expansion using structured outputs
+            expansion = await self._expand_query_with_ai(query)
 
+            # Collect all search terms for vector search
+            variants = [query] + expansion.query_variants
 
-            # General paraphrases
-            general_variants = [
-                f"overview of {query}",
-                f"{query} details",
-                f"information about {query}",
-            ]
-            variants.extend(general_variants)
-            # Optional: ask LLM for 3-5 short alternative queries
-            try:
-                if os.getenv("OPENAI_API_KEY"):
-                    from openai import OpenAI  # type: ignore
-                    _c = OpenAI()
-                    prompt = (
-                        "Generate 4 alternative short search queries (<=5 words) for this question. "
-                        "Return a JSON array of strings only. Question: " + query
-                    )
+            # Collect all keywords for text search (to be implemented)
+            all_keywords = expansion.keywords + expansion.domain_terms
+            all_phrases = expansion.phrases
 
-                    cmp = _c.chat.completions.create(
-                        model=os.getenv("LLM_MULTIQUERY_MODEL", "gpt-4o-mini"),
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.3
-                    )
-
-                    txt = (cmp.choices[0].message.content or "").strip()
-                    if txt:
-                        import json as _json
-                        alts = _json.loads(txt)
-                        if isinstance(alts, list):
-                            llm_variants = [str(x)[:80] for x in alts if isinstance(x, str)]
-                            variants.extend(llm_variants)
-            except Exception:
-                pass  # Silently continue without LLM variants
-
-            # Log query variants concisely
-            logger.info(f"📝 VARIANTS ({len(variants)}): {variants}")
+            # Log query expansion results
+            logger.info(f"📝 VARIANTS ({len(expansion.query_variants)}): {expansion.query_variants}")
+            logger.info(f"🔑 KEYWORDS ({len(expansion.keywords)}): {expansion.keywords}")
+            logger.info(f"📄 PHRASES ({len(expansion.phrases)}): {expansion.phrases}")
+            logger.info(f"🏢 DOMAIN ({len(expansion.domain_terms)}): {expansion.domain_terms}")
 
             # Build tenant domain whitelist from accepted URLs (if available)
             allowed_domains = set()
@@ -714,11 +778,26 @@ class MCPServer:
                 domain = url.split('/')[2] if url.startswith('http') else url
                 logger.info(f"  {i}. {snippet_preview} [{domain}]")
 
+            # Build metadata with query expansion info
+            metadata = {
+                "snippets": snippets,
+                "citations": citations,
+                "k": k,
+                "faiss": True,
+                "query_expansion": {
+                    "original_query": query,
+                    "variants_used": expansion.query_variants,
+                    "keywords_extracted": expansion.keywords,
+                    "phrases_extracted": expansion.phrases,
+                    "domain_terms": expansion.domain_terms
+                }
+            }
+
             return {
                 "content": [{"type": "text", "text": f"Retrieved {len(snippets)} snippets via FAISS"}],
                 "isError": False,
                 "toolCallId": "lookup_kb_result",
-                "metadata": {"snippets": snippets, "citations": citations, "k": k, "faiss": True}
+                "metadata": metadata
             }
 
         # Fallback to lexical minimal lookup
@@ -738,11 +817,23 @@ class MCPServer:
             domain = url.split('/')[2] if url.startswith('http') else url
             logger.info(f"  {i}. {snippet_preview} [{domain}]")
 
+        # Add query expansion info to lexical fallback too
+        fallback_metadata = result | {
+            "faiss": False,
+            "query_expansion": {
+                "original_query": query,
+                "variants_used": expansion.query_variants,
+                "keywords_extracted": expansion.keywords,
+                "phrases_extracted": expansion.phrases,
+                "domain_terms": expansion.domain_terms
+            }
+        }
+
         return {
             "content": [{"type": "text", "text": f"Retrieved {len(snippets)} snippets via lexical"}],
             "isError": False,
             "toolCallId": "lookup_kb_result",
-            "metadata": result | {"faiss": False}
+            "metadata": fallback_metadata
         }
 class MCPTransport:
     """Handles MCP protocol communication over stdio"""
