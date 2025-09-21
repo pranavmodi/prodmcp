@@ -669,6 +669,9 @@ Query to analyze: {query}""",
         # Clean, focused logging
         logger.info(f"🔍 QUERY: '{query}' (tenant: {tenant_id[:8]}..., k: {k})")
 
+        # Ensure expansion variable is always defined to avoid UnboundLocalError in fallbacks
+        expansion = None
+
         # Try FAISS-backed retrieval first; build if missing. Fallback to minimal KB.
         try:
             store = FAISSStore(tenant_id=tenant_id)
@@ -778,7 +781,7 @@ Query to analyze: {query}""",
                 domain = url.split('/')[2] if url.startswith('http') else url
                 logger.info(f"  {i}. {snippet_preview} [{domain}]")
 
-            # Build metadata with query expansion info
+            # Build metadata with query expansion info (guard if expansion not available)
             metadata = {
                 "snippets": snippets,
                 "citations": citations,
@@ -786,10 +789,10 @@ Query to analyze: {query}""",
                 "faiss": True,
                 "query_expansion": {
                     "original_query": query,
-                    "variants_used": expansion.query_variants,
-                    "keywords_extracted": expansion.keywords,
-                    "phrases_extracted": expansion.phrases,
-                    "domain_terms": expansion.domain_terms
+                    "variants_used": (expansion.query_variants if expansion else []),
+                    "keywords_extracted": (expansion.keywords if expansion else []),
+                    "phrases_extracted": (expansion.phrases if expansion else []),
+                    "domain_terms": (expansion.domain_terms if expansion else [])
                 }
             }
 
@@ -817,15 +820,15 @@ Query to analyze: {query}""",
             domain = url.split('/')[2] if url.startswith('http') else url
             logger.info(f"  {i}. {snippet_preview} [{domain}]")
 
-        # Add query expansion info to lexical fallback too
+        # Add query expansion info to lexical fallback too (guard if expansion not available)
         fallback_metadata = result | {
             "faiss": False,
             "query_expansion": {
                 "original_query": query,
-                "variants_used": expansion.query_variants,
-                "keywords_extracted": expansion.keywords,
-                "phrases_extracted": expansion.phrases,
-                "domain_terms": expansion.domain_terms
+                "variants_used": (expansion.query_variants if expansion else []),
+                "keywords_extracted": (expansion.keywords if expansion else []),
+                "phrases_extracted": (expansion.phrases if expansion else []),
+                "domain_terms": (expansion.domain_terms if expansion else [])
             }
         }
 
