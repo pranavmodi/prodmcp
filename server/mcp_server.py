@@ -644,32 +644,69 @@ Query to analyze: {query}""",
 
                 response.raise_for_status()
                 result = response.json()
+                try:
+                    logger.debug(f"Responses API keys: {list(result.keys())}")
+                except Exception:
+                    pass
 
-                # Extract the structured content from the response (Responses API format)
-                if "text" in result:
-                    # Handle potential error
-                    if "error" in result and result["error"]:
-                        logger.error(f"OpenAI Responses API returned error field: {result['error']}")
-                        raise ValueError(f"OpenAI Responses API error: {result['error']}")
+                # Extract structured content from Responses API
+                # Prefer output array's output_text entries; fallback to top-level text if string
+                data = None
+                # 1) Prefer explicit parsed output if provided by API
+                try:
+                    if isinstance(result.get("output_parsed"), dict):
+                        data = result.get("output_parsed")
+                except Exception:
+                    data = None
 
-                    content = result.get("text")
-                    if not content:
-                        logger.error("OpenAI Responses API returned empty 'text' field")
-                        raise ValueError("Empty text response from OpenAI Responses API")
-
-                    # Check if content is already parsed or if it's a string
-                    if isinstance(content, dict):
-                        # Content is already structured data
-                        data = content
-                    else:
-                        # Content is a JSON string that needs parsing
+                # 2) Traverse output -> message -> content -> output_text
+                if data is None:
+                    try:
                         import json as _json
-                        data = _json.loads(content)
+                        output = result.get("output") or []
+                        for item in output:
+                            if not isinstance(item, dict):
+                                continue
+                            # Direct output_text item
+                            if item.get("type") == "output_text" and isinstance(item.get("text"), str):
+                                try:
+                                    data = _json.loads(item["text"])  # expect JSON string
+                                    break
+                                except Exception:
+                                    continue
+                            # Message container with content parts
+                            if item.get("type") == "message":
+                                for part in item.get("content", []) or []:
+                                    if isinstance(part, dict) and part.get("type") == "output_text" and isinstance(part.get("text"), str):
+                                        try:
+                                            data = _json.loads(part["text"])  # expect JSON string
+                                            break
+                                        except Exception:
+                                            continue
+                                if data is not None:
+                                    break
+                    except Exception:
+                        data = None
 
-                    return QueryExpansion(**data)
-                else:
-                    logger.error("OpenAI Responses API invalid response: missing 'text' field")
+                # 3) Fallback to top-level text string
+                if data is None:
+                    content = result.get("text")
+                    if isinstance(content, str) and content.strip():
+                        try:
+                            import json as _json
+                            data = _json.loads(content)
+                        except Exception:
+                            data = None
+
+                if data is None:
+                    logger.error("OpenAI Responses API invalid/missing structured text content (no output_text or JSON 'text')")
                     raise ValueError("Invalid response structure from OpenAI Responses API")
+
+                try:
+                    return QueryExpansion(**data)
+                except Exception as e:
+                    logger.error(f"OpenAI Responses API JSON did not match schema: {e}. Data keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+                    raise
         except Exception as e:
             logger.error(f"OpenAI Responses API call failed: {e}", exc_info=True)
             raise
