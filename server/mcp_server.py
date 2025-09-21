@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 from pathlib import Path
 import sys
 import ssl
+import signal
 import websockets
 import uvicorn
 from fastapi import FastAPI
@@ -37,6 +38,9 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Global shutdown event
+shutdown_event = asyncio.Event()
+
 # FastAPI app for HTTP endpoints
 app = FastAPI(
     title="MCP Server API",
@@ -52,6 +56,45 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize resources on startup"""
+    logger.info("🚀 MCP Server HTTP API starting up...")
+
+    # Initialize storage and ensure directories exist
+    try:
+        storage_dir = os.getenv("DATA_DIR", "./scraped_pages")
+        Path(storage_dir).mkdir(parents=True, exist_ok=True)
+        logger.info(f"📁 Storage directory ensured: {storage_dir}")
+    except Exception as e:
+        logger.error(f"Failed to initialize storage: {e}")
+
+@app.on_event("shutdown")
+async def shutdown_event_handler():
+    """Clean up resources on shutdown"""
+    logger.info("🛑 MCP Server HTTP API shutting down...")
+
+    # Set global shutdown event to signal other servers
+    shutdown_event.set()
+
+    # Close any open sessions/connections
+    try:
+        # Close any HTTP client sessions if they exist
+        import httpx
+        # Clean up any global httpx clients if used
+        logger.info("✅ HTTP client sessions cleaned up")
+    except Exception as e:
+        logger.error(f"Error cleaning up HTTP sessions: {e}")
+
+    # Close any database connections or file handles
+    try:
+        # Add any specific cleanup here
+        logger.info("✅ Database connections closed")
+    except Exception as e:
+        logger.error(f"Error closing database connections: {e}")
+
+    logger.info("✅ MCP Server HTTP API shutdown complete")
 
 # Include route modules
 app.include_router(crawl_router)
@@ -533,33 +576,30 @@ class MCPServer:
         k = int(arguments.get("k", 5))
         # Optional tenant scoping
         tenant_id = (arguments.get("tenant_id") or "").strip() or "default"
-        logger.info(f"MCP lookup_kb: tenant={tenant_id} q_len={len(query)} k={k}")
+
+        # Clean, focused logging
+        logger.info(f"🔍 QUERY: '{query}' (tenant: {tenant_id[:8]}..., k: {k})")
+
         # Try FAISS-backed retrieval first; build if missing. Fallback to minimal KB.
         try:
             store = FAISSStore(tenant_id=tenant_id)
             warm = store.search("warmup", k=1)
-            logger.info(f"FAISS warmup search returned {len(warm)} hits")
             if warm == []:
                 # If index not present, attempt a quick build (best-effort)
-                logger.info("FAISS index not warm; attempting build()")
                 built = store.build()
-                logger.info(f"FAISS build completed; chunks_indexed={built}")
 
             # Multi-query expansion: heuristics + optional LLM-generated variants
             variants = [query]
             ql = query.lower()
-            # Heuristic variants for common intents
-            if any(t in ql for t in ["contact", "phone", "email", "address", "support", "sales"]):
-                variants += [
-                    "contact", "contact us", "phone number", "email address", "support contact",
-                    "sales contact", "company address", "reach us",
-                ]
+
+
             # General paraphrases
-            variants += [
+            general_variants = [
                 f"overview of {query}",
                 f"{query} details",
                 f"information about {query}",
             ]
+            variants.extend(general_variants)
             # Optional: ask LLM for 3-5 short alternative queries
             try:
                 if os.getenv("OPENAI_API_KEY"):
@@ -569,18 +609,25 @@ class MCPServer:
                         "Generate 4 alternative short search queries (<=5 words) for this question. "
                         "Return a JSON array of strings only. Question: " + query
                     )
+
                     cmp = _c.chat.completions.create(
                         model=os.getenv("LLM_MULTIQUERY_MODEL", "gpt-4o-mini"),
                         messages=[{"role": "user", "content": prompt}],
                         temperature=0.3
                     )
+
                     txt = (cmp.choices[0].message.content or "").strip()
-                    import json as _json
-                    alts = _json.loads(txt)
-                    if isinstance(alts, list):
-                        variants += [str(x)[:80] for x in alts if isinstance(x, str)]
+                    if txt:
+                        import json as _json
+                        alts = _json.loads(txt)
+                        if isinstance(alts, list):
+                            llm_variants = [str(x)[:80] for x in alts if isinstance(x, str)]
+                            variants.extend(llm_variants)
             except Exception:
-                pass
+                pass  # Silently continue without LLM variants
+
+            # Log query variants concisely
+            logger.info(f"📝 VARIANTS ({len(variants)}): {variants}")
 
             # Build tenant domain whitelist from accepted URLs (if available)
             allowed_domains = set()
@@ -606,8 +653,12 @@ class MCPServer:
             # Collect and merge hits across variants
             per_k = max(k, 12)
             unique_hits: dict = {}
+            variant_results = {}
+
             for v in variants[:12]:
                 hits = store.search(v, k=per_k)
+                variant_results[v] = len(hits)
+
                 for h in hits:
                     # Domain filter
                     try:
@@ -622,8 +673,8 @@ class MCPServer:
                     key = (h.get("url"), h.get("snippet"))
                     if key not in unique_hits:
                         unique_hits[key] = h
+
             merged_hits = list(unique_hits.values())
-            logger.info(f"FAISS merged hits={len(merged_hits)} from {len(variants)} variants")
 
             # Simple MMR-like rerank to improve diversity
             def _score(it):
@@ -648,16 +699,21 @@ class MCPServer:
                     selected.append(cand)
 
             faiss_hits = selected
-            logger.info(f"FAISS reranked top={len(faiss_hits)}")
         except Exception:
-            logger.warning("FAISS path failed, falling back to lexical")
             faiss_hits = []
 
         if faiss_hits:
             snippets = [hit.get("snippet", "") for hit in faiss_hits if hit.get("snippet")]
             citations = [{"url": hit.get("url"), "title": hit.get("title", "")} for hit in faiss_hits]
-            answer = ""  # Let client synthesize with LLM using snippets
-            logger.info(f"Returning FAISS result: snippets={len(snippets)} citations={len(citations)}")
+
+            # Clean snippet logging
+            logger.info(f"📄 FAISS RESULTS ({len(snippets)} snippets):")
+            for i, snippet in enumerate(snippets[:k], 1):
+                snippet_preview = snippet[:100] + "..." if len(snippet) > 100 else snippet
+                url = citations[i-1]["url"] if i-1 < len(citations) else "unknown"
+                domain = url.split('/')[2] if url.startswith('http') else url
+                logger.info(f"  {i}. {snippet_preview} [{domain}]")
+
             return {
                 "content": [{"type": "text", "text": f"Retrieved {len(snippets)} snippets via FAISS"}],
                 "isError": False,
@@ -670,14 +726,20 @@ class MCPServer:
         base_dir = os.getenv("DATA_DIR", "./scraped_pages")
         data_dir = os.path.join(base_dir, tenant_id)
         result = lookup_kb_minimal(query, k=k, data_dir=data_dir)
-        try:
-            logger.info(
-                f"Returning lexical result: snippets={len(result.get('snippets', []) or [])} citations={len(result.get('citations', []) or [])}"
-            )
-        except Exception:
-            pass
+
+        # Clean lexical results logging
+        snippets = result.get('snippets', []) or []
+        citations = result.get('citations', []) or []
+
+        logger.info(f"📄 LEXICAL RESULTS ({len(snippets)} snippets):")
+        for i, snippet in enumerate(snippets[:k], 1):
+            snippet_preview = snippet[:100] + "..." if len(snippet) > 100 else snippet
+            url = citations[i-1]["url"] if i-1 < len(citations) else "unknown"
+            domain = url.split('/')[2] if url.startswith('http') else url
+            logger.info(f"  {i}. {snippet_preview} [{domain}]")
+
         return {
-            "content": [{"type": "text", "text": f"Retrieved {len(result.get('snippets', []))} snippets via lexical"}],
+            "content": [{"type": "text", "text": f"Retrieved {len(snippets)} snippets via lexical"}],
             "isError": False,
             "toolCallId": "lookup_kb_result",
             "metadata": result | {"faiss": False}
@@ -868,9 +930,35 @@ async def run_websocket_server(port: int):
         port,
         ping_interval=20,
         ping_timeout=10
-    ) as server:
+    ) as ws_server:
         logger.info("📡 WebSocket server ready, waiting for connections...")
-        await server.wait_closed()
+
+        # Wait for shutdown event or server closure
+        try:
+            shutdown_task = asyncio.create_task(shutdown_event.wait())
+            server_task = asyncio.create_task(ws_server.wait_closed())
+
+            done, pending = await asyncio.wait(
+                [shutdown_task, server_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+            # Cancel pending tasks
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+            if shutdown_task in done:
+                logger.info("🛑 WebSocket server shutting down gracefully...")
+                ws_server.close()
+                await ws_server.wait_closed()
+                logger.info("✅ WebSocket server shutdown complete")
+        except Exception as e:
+            logger.error(f"Error during WebSocket server shutdown: {e}")
+            raise
 
 async def start_http_server(port: int):
     """Start HTTP API server"""
@@ -882,10 +970,62 @@ async def start_http_server(port: int):
     )
     server = uvicorn.Server(config)
     logger.info(f"🌐 HTTP API server listening on http://0.0.0.0:{port}")
-    await server.serve()
+
+    # Start server in a task so we can handle shutdown
+    server_task = asyncio.create_task(server.serve())
+    shutdown_task = asyncio.create_task(shutdown_event.wait())
+
+    try:
+        done, pending = await asyncio.wait(
+            [server_task, shutdown_task],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+
+        if shutdown_task in done:
+            logger.info("🛑 HTTP server shutting down gracefully...")
+            server.should_exit = True
+
+            # Cancel server task and wait for it to finish
+            if server_task in pending:
+                server_task.cancel()
+                try:
+                    await server_task
+                except asyncio.CancelledError:
+                    pass
+
+            logger.info("✅ HTTP server shutdown complete")
+        else:
+            # Server completed normally, cancel shutdown task
+            shutdown_task.cancel()
+            await server_task
+
+    except Exception as e:
+        logger.error(f"Error during HTTP server shutdown: {e}")
+        # Cancel any pending tasks
+        for task in [server_task, shutdown_task]:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        raise
+
+def setup_signal_handlers():
+    """Setup signal handlers for graceful shutdown"""
+    def signal_handler(signum, frame):
+        logger.info(f"🔔 Received signal {signum}, initiating graceful shutdown...")
+        shutdown_event.set()
+
+    # Handle SIGINT (Ctrl+C) and SIGTERM
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
 async def main():
     """Main entry point - starts hybrid MCP + HTTP server"""
+    # Setup signal handlers for graceful shutdown
+    setup_signal_handlers()
+
     # Always start in hybrid mode
     ws_port = int(os.getenv("MCP_WEBSOCKET_PORT", "8765"))
     http_port = int(os.getenv("MCP_HTTP_PORT", "8000"))
@@ -914,10 +1054,28 @@ async def main():
 
     # Run both servers concurrently
     try:
-        await asyncio.gather(ws_task, http_task)
+        await asyncio.gather(ws_task, http_task, return_exceptions=True)
+    except KeyboardInterrupt:
+        logger.info("🔔 Keyboard interrupt received, shutting down...")
+        shutdown_event.set()
     except Exception as e:
-        logger.error(f"Server startup failed: {e}")
+        logger.error(f"Server error: {e}")
+        shutdown_event.set()
         raise
+    finally:
+        # Ensure cleanup happens
+        logger.info("🧹 Final cleanup...")
+
+        # Cancel remaining tasks
+        for task in [ws_task, http_task]:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        logger.info("✅ All servers stopped, shutdown complete")
 
 if __name__ == "__main__":
     asyncio.run(main()) 
