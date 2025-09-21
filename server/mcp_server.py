@@ -39,6 +39,21 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Reduce noise from third-party libraries
+for _noisy in [
+    "httpx",
+    "websockets",
+    "faiss",
+    "faiss.loader",
+    "uvicorn",
+    "uvicorn.error",
+    "uvicorn.access",
+]:
+    try:
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
+    except Exception:
+        pass
+
 # Global shutdown event
 shutdown_event = asyncio.Event()
 
@@ -158,7 +173,7 @@ class MCPServer:
     async def handle_initialize(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Handle MCP initialization"""
         try:
-            logger.info(f"MCP initialize received: params_keys={list((params or {}).keys())}")
+            logger.debug(f"MCP initialize received: params_keys={list((params or {}).keys())}")
         except Exception:
             pass
         return {
@@ -174,7 +189,7 @@ class MCPServer:
     
     async def handle_tools_list(self) -> Dict[str, Any]:
         """Handle tools/list request"""
-        logger.info("MCP tools/list requested")
+        logger.debug("MCP tools/list requested")
         return {
             "tools": self.tools
         }
@@ -182,10 +197,8 @@ class MCPServer:
     async def handle_tools_call(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Handle tools/call request"""
         try:
-            try:
-                logger.info(f"MCP tools/call: name={name} args_keys={list((arguments or {}).keys())}")
-            except Exception:
-                pass
+            # Demote verbose call tracing; keep minimal signal in INFO by omitting
+            # logger.info for method/args to reduce log noise
             if name == "lookup_kb":
                 return await self._lookup_kb(arguments)
             else:
@@ -631,8 +644,7 @@ Query to analyze: {query}""",
             response.raise_for_status()
             result = response.json()
 
-            # Debug: Log the response structure
-            logger.info(f"Responses API response structure: {list(result.keys())}")
+            # Suppress verbose response structure logging
 
             # Extract the structured content from the response (Responses API format)
             if "text" in result:
@@ -666,8 +678,8 @@ Query to analyze: {query}""",
         # Optional tenant scoping
         tenant_id = (arguments.get("tenant_id") or "").strip() or "default"
 
-        # Clean, focused logging
-        logger.info(f"🔍 QUERY: '{query}' (tenant: {tenant_id[:8]}..., k: {k})")
+        # Minimal high-signal logging
+        logger.info(f"🔍 query: '{query}'")
 
         # Ensure expansion variable is always defined to avoid UnboundLocalError in fallbacks
         expansion = None
@@ -690,11 +702,12 @@ Query to analyze: {query}""",
             all_keywords = expansion.keywords + expansion.domain_terms
             all_phrases = expansion.phrases
 
-            # Log query expansion results
-            logger.info(f"📝 VARIANTS ({len(expansion.query_variants)}): {expansion.query_variants}")
-            logger.info(f"🔑 KEYWORDS ({len(expansion.keywords)}): {expansion.keywords}")
-            logger.info(f"📄 PHRASES ({len(expansion.phrases)}): {expansion.phrases}")
-            logger.info(f"🏢 DOMAIN ({len(expansion.domain_terms)}): {expansion.domain_terms}")
+            # Log only the essential expansion results
+            try:
+                logger.info(f"📝 variants: {expansion.query_variants}")
+                logger.info(f"🔑 keywords: {expansion.keywords}")
+            except Exception:
+                pass
 
             # Build tenant domain whitelist from accepted URLs (if available)
             allowed_domains = set()
@@ -773,13 +786,11 @@ Query to analyze: {query}""",
             snippets = [hit.get("snippet", "") for hit in faiss_hits if hit.get("snippet")]
             citations = [{"url": hit.get("url"), "title": hit.get("title", "")} for hit in faiss_hits]
 
-            # Clean snippet logging
-            logger.info(f"📄 FAISS RESULTS ({len(snippets)} snippets):")
+            # Log snippets succinctly
+            logger.info(f"📄 snippets ({len(snippets)}):")
             for i, snippet in enumerate(snippets[:k], 1):
-                snippet_preview = snippet[:100] + "..." if len(snippet) > 100 else snippet
-                url = citations[i-1]["url"] if i-1 < len(citations) else "unknown"
-                domain = url.split('/')[2] if url.startswith('http') else url
-                logger.info(f"  {i}. {snippet_preview} [{domain}]")
+                snippet_preview = snippet[:140] + "..." if len(snippet) > 140 else snippet
+                logger.info(f"  {i}. {snippet_preview}")
 
             # Build metadata with query expansion info (guard if expansion not available)
             metadata = {
@@ -807,18 +818,15 @@ Query to analyze: {query}""",
         from kb import lookup_kb_minimal
         base_dir = os.getenv("DATA_DIR", "./scraped_pages")
         data_dir = os.path.join(base_dir, tenant_id)
-        result = lookup_kb_minimal(query, k=k, data_dir=data_dir)
+        # Use retrieve_only to ensure we get raw snippets for logging
+        result = lookup_kb_minimal(query, k=k, data_dir=data_dir, retrieve_only=True)
 
-        # Clean lexical results logging
+        # Log lexical snippets succinctly
         snippets = result.get('snippets', []) or []
-        citations = result.get('citations', []) or []
-
-        logger.info(f"📄 LEXICAL RESULTS ({len(snippets)} snippets):")
+        logger.info(f"📄 snippets ({len(snippets)}):")
         for i, snippet in enumerate(snippets[:k], 1):
-            snippet_preview = snippet[:100] + "..." if len(snippet) > 100 else snippet
-            url = citations[i-1]["url"] if i-1 < len(citations) else "unknown"
-            domain = url.split('/')[2] if url.startswith('http') else url
-            logger.info(f"  {i}. {snippet_preview} [{domain}]")
+            snippet_preview = snippet[:140] + "..." if len(snippet) > 140 else snippet
+            logger.info(f"  {i}. {snippet_preview}")
 
         # Add query expansion info to lexical fallback too (guard if expansion not available)
         fallback_metadata = result | {
@@ -847,7 +855,7 @@ class MCPTransport:
     
     async def run(self):
         """Run the MCP server over stdio"""
-        logger.info("Starting MCP server over stdio")
+        logger.debug("Starting MCP server over stdio")
         
         while True:
             try:
@@ -858,7 +866,7 @@ class MCPTransport:
                 
                 raw = line.strip()
                 try:
-                    logger.info(f"MCP STDIO RX: {raw[:200]}{'...' if len(raw)>200 else ''}")
+                    logger.debug(f"MCP STDIO RX: {raw[:200]}{'...' if len(raw)>200 else ''}")
                 except Exception:
                     pass
                 request = json.loads(raw)
@@ -867,7 +875,7 @@ class MCPTransport:
                 # Send response to stdout
                 out = json.dumps(response)
                 try:
-                    logger.info(f"MCP STDIO TX: {out[:200]}{'...' if len(out)>200 else ''}")
+                    logger.debug(f"MCP STDIO TX: {out[:200]}{'...' if len(out)>200 else ''}")
                 except Exception:
                     pass
                 print(out, flush=True)
@@ -930,7 +938,7 @@ class MCPWebSocketTransport:
     async def handle_client(self, websocket, path):
         """Handle a new WebSocket client connection"""
         client_id = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
-        logger.info(f"MCP WebSocket client connected: {client_id} (path: {path})")
+        logger.debug(f"MCP WebSocket client connected: {client_id} (path: {path})")
         self.clients.add(websocket)
 
         try:
@@ -938,14 +946,14 @@ class MCPWebSocketTransport:
                 try:
                     # Parse incoming JSON-RPC request
                     raw_data = message
-                    logger.info(f"MCP WS RX [{client_id}]: {raw_data[:200]}{'...' if len(raw_data)>200 else ''}")
+                    logger.debug(f"MCP WS RX [{client_id}]: {raw_data[:200]}{'...' if len(raw_data)>200 else ''}")
 
                     request = json.loads(raw_data)
                     response = await self._handle_request(request)
 
                     # Send JSON-RPC response
                     response_data = json.dumps(response)
-                    logger.info(f"MCP WS TX [{client_id}]: {response_data[:200]}{'...' if len(response_data)>200 else ''}")
+                    logger.debug(f"MCP WS TX [{client_id}]: {response_data[:200]}{'...' if len(response_data)>200 else ''}")
 
                     await websocket.send(response_data)
 
@@ -959,7 +967,7 @@ class MCPWebSocketTransport:
                     await websocket.send(json.dumps(error_response))
 
         except websockets.exceptions.ConnectionClosed:
-            logger.info(f"MCP WebSocket client disconnected: {client_id}")
+            logger.debug(f"MCP WebSocket client disconnected: {client_id}")
         except Exception as e:
             logger.error(f"WebSocket error for client {client_id}: {e}")
         finally:
@@ -1016,7 +1024,7 @@ async def run_websocket_server(port: int):
         await ws_transport.handle_client(websocket, path)
 
     # Start WebSocket server
-    logger.info(f"🚀 MCP WebSocket server listening on ws://0.0.0.0:{port}")
+    logger.debug(f"🚀 MCP WebSocket server listening on ws://0.0.0.0:{port}")
 
     async with websockets.serve(
         websocket_handler,
@@ -1125,7 +1133,7 @@ async def main():
     http_port = int(os.getenv("MCP_HTTP_PORT", "8000"))
 
     logger.info("🚀 Starting Hybrid MCP + HTTP Server")
-    logger.info(f"📡 MCP WebSocket: ws://0.0.0.0:{ws_port}")
+    logger.debug(f"📡 MCP WebSocket: ws://0.0.0.0:{ws_port}")
     logger.info(f"🌐 HTTP API: http://0.0.0.0:{http_port}")
 
     # Create tasks for both servers with error handling
