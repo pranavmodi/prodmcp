@@ -76,7 +76,12 @@ class OpenAIEmbedder:
             import faiss  # type: ignore
             faiss.normalize_L2(arr)
             return arr
-        except Exception:
+        except Exception as e:
+            try:
+                import logging as _logging
+                _logging.getLogger(__name__).error(f"OpenAI Embeddings call failed: {e}", exc_info=True)
+            except Exception:
+                pass
             return None
 
 

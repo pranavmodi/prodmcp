@@ -634,40 +634,45 @@ Query to analyze: {query}""",
             "temperature": 0.3
         }
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(url, headers=headers, json=payload)
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(url, headers=headers, json=payload)
 
-            # Debug: Log the error response if request fails
-            if response.status_code != 200:
-                logger.error(f"OpenAI Responses API error {response.status_code}: {response.text}")
+                # Log non-200 status as error with body
+                if response.status_code != 200:
+                    logger.error(f"OpenAI Responses API HTTP {response.status_code}: {response.text}")
 
-            response.raise_for_status()
-            result = response.json()
+                response.raise_for_status()
+                result = response.json()
 
-            # Suppress verbose response structure logging
+                # Extract the structured content from the response (Responses API format)
+                if "text" in result:
+                    # Handle potential error
+                    if "error" in result and result["error"]:
+                        logger.error(f"OpenAI Responses API returned error field: {result['error']}")
+                        raise ValueError(f"OpenAI Responses API error: {result['error']}")
 
-            # Extract the structured content from the response (Responses API format)
-            if "text" in result:
-                # Handle potential error
-                if "error" in result and result["error"]:
-                    raise ValueError(f"OpenAI Responses API error: {result['error']}")
+                    content = result.get("text")
+                    if not content:
+                        logger.error("OpenAI Responses API returned empty 'text' field")
+                        raise ValueError("Empty text response from OpenAI Responses API")
 
-                content = result.get("text")
-                if not content:
-                    raise ValueError("Empty text response from OpenAI Responses API")
+                    # Check if content is already parsed or if it's a string
+                    if isinstance(content, dict):
+                        # Content is already structured data
+                        data = content
+                    else:
+                        # Content is a JSON string that needs parsing
+                        import json as _json
+                        data = _json.loads(content)
 
-                # Check if content is already parsed or if it's a string
-                if isinstance(content, dict):
-                    # Content is already structured data
-                    data = content
+                    return QueryExpansion(**data)
                 else:
-                    # Content is a JSON string that needs parsing
-                    import json as _json
-                    data = _json.loads(content)
-
-                return QueryExpansion(**data)
-            else:
-                raise ValueError("Invalid response structure from OpenAI Responses API")
+                    logger.error("OpenAI Responses API invalid response: missing 'text' field")
+                    raise ValueError("Invalid response structure from OpenAI Responses API")
+        except Exception as e:
+            logger.error(f"OpenAI Responses API call failed: {e}", exc_info=True)
+            raise
 
     async def _lookup_kb(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Lookup knowledge base from local scraped JSON using a minimal RAG approach."""
@@ -684,6 +689,17 @@ Query to analyze: {query}""",
         # Ensure expansion variable is always defined to avoid UnboundLocalError in fallbacks
         expansion = None
 
+        # Perform query expansion first so we can always log variants/keywords
+        try:
+            expansion = await self._expand_query_with_ai(query)
+            try:
+                logger.info(f"📝 variants: {expansion.query_variants}")
+                logger.info(f"🔑 keywords: {expansion.keywords}")
+            except Exception:
+                pass
+        except Exception:
+            expansion = None
+
         # Try FAISS-backed retrieval first; build if missing. Fallback to minimal KB.
         try:
             store = FAISSStore(tenant_id=tenant_id)
@@ -692,22 +708,12 @@ Query to analyze: {query}""",
                 # If index not present, attempt a quick build (best-effort)
                 built = store.build()
 
-            # AI-powered query expansion using structured outputs
-            expansion = await self._expand_query_with_ai(query)
-
             # Collect all search terms for vector search
-            variants = [query] + expansion.query_variants
+            variants = [query] + (expansion.query_variants if expansion else [])
 
             # Collect all keywords for text search (to be implemented)
-            all_keywords = expansion.keywords + expansion.domain_terms
-            all_phrases = expansion.phrases
-
-            # Log only the essential expansion results
-            try:
-                logger.info(f"📝 variants: {expansion.query_variants}")
-                logger.info(f"🔑 keywords: {expansion.keywords}")
-            except Exception:
-                pass
+            all_keywords = (expansion.keywords + expansion.domain_terms) if expansion else []
+            all_phrases = (expansion.phrases) if expansion else []
 
             # Build tenant domain whitelist from accepted URLs (if available)
             allowed_domains = set()

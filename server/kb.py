@@ -299,7 +299,12 @@ def lookup_kb_minimal(query: str, k: int = 5, data_dir: str | None = None, retri
             "citations": citations,
             "confidence": 0.7,
         }
-    except Exception:
+    except Exception as e:
+        try:
+            import logging as _logging
+            _logging.getLogger(__name__).error(f"OpenAI Chat Completions call failed: {e}", exc_info=True)
+        except Exception:
+            pass
         joined = "\n\n".join(doc["snippet"] for doc in top)
         return {
             "answer": joined[:1200] if joined.strip() else "",
