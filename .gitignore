@@ -69,4 +69,5 @@ logs/
 *.backup
 
 # Scraped data (optional - uncomment if you don't want to track scraped files)
-# server/scraped_pages/ 
+# server/scraped_pages/ .venv/
+server/scraped_pages/
